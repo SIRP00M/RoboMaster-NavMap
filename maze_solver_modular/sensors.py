@@ -1,6 +1,7 @@
 """Sensor reading, calibration and filtering."""
 
 import statistics
+import time
 from collections import deque
 
 import config
@@ -17,6 +18,7 @@ class SensorManager:
         self.sharp_left_ema = None
         self.sharp_right_ema = None
         self.front_cm = None
+        self.tof_last_update = None
 
     # ========================================================
     # TOF
@@ -36,23 +38,33 @@ class SensorManager:
             cm = mm / 10.0
             self.tof_buffer.append(cm)
             self.front_cm = statistics.median(self.tof_buffer)
+            self.tof_last_update = time.monotonic()
 
         except Exception as exc:
             print("ToF callback error:", exc)
+
+    def get_front_cm(self):
+        """Return fresh ToF distance, or None if data is absent/stale."""
+        if self.front_cm is None or self.tof_last_update is None:
+            return None
+
+        age = time.monotonic() - self.tof_last_update
+        if age > config.TOF_STALE_SEC:
+            return None
+
+        return self.front_cm
 
     # ========================================================
     # SHARP CALIBRATION
     # ========================================================
 
     @staticmethod
-    def adc_to_cm(adc):
-        table = config.CALIBRATION_SHARP2
-
+    def adc_to_cm(adc, table):
         if adc >= table[0][0]:
-            return 5.0
+            return float(table[0][1])
 
         if adc <= table[-1][0]:
-            return 80.0
+            return float(table[-1][1])
 
         for i in range(len(table) - 1):
             adc1, cm1 = table[i]
@@ -62,17 +74,28 @@ class SensorManager:
                 ratio = (adc1 - adc) / (adc1 - adc2)
                 return cm1 + ratio * (cm2 - cm1)
 
-        return 80.0
+        return float(table[-1][1])
+
+    def calibration_for_sensor(self, sensor_id):
+        if sensor_id == config.SHARP_LEFT_ID:
+            return config.CALIBRATION_SHARP_LEFT
+        if sensor_id == config.SHARP_RIGHT_ID:
+            return config.CALIBRATION_SHARP_RIGHT
+        raise ValueError(f"Unknown Sharp sensor id: {sensor_id}")
 
     # ========================================================
     # SHARP READ + FILTER
     # ========================================================
 
     def read_sharp_raw_and_cm(self, sensor_id):
-        raw = self.sensor_adapter.get_adc(
-            id=sensor_id,
-            port=config.SENSOR_PORT,
-        )
+        try:
+            raw = self.sensor_adapter.get_adc(
+                id=sensor_id,
+                port=config.SENSOR_PORT,
+            )
+        except Exception as exc:
+            print(f"Sharp {sensor_id} read error: {exc}")
+            return 0, None
 
         if sensor_id == config.SHARP_LEFT_ID:
             self.sharp_left_buffer.append(raw)
@@ -105,7 +128,8 @@ class SensorManager:
         else:
             raise ValueError(f"Unknown Sharp sensor id: {sensor_id}")
 
-        return raw, self.adc_to_cm(ema_val)
+        table = self.calibration_for_sensor(sensor_id)
+        return raw, self.adc_to_cm(ema_val, table)
 
     def read_left_sharp(self):
         return self.read_sharp_raw_and_cm(config.SHARP_LEFT_ID)
@@ -125,11 +149,14 @@ class SensorManager:
             )
 
         except Exception:
-            raw = self.sensor_adapter.get_adc(
-                id=config.IR_LEFT_FRONT_ID,
-                port=config.SENSOR_PORT,
-            )
-            return 1 if raw > 300 else 0
+            try:
+                raw = self.sensor_adapter.get_adc(
+                    id=config.IR_LEFT_FRONT_ID,
+                    port=config.SENSOR_PORT,
+                )
+                return 1 if raw > 300 else 0
+            except Exception:
+                return None
 
     # ========================================================
     # RESET FILTERS AFTER TURN
@@ -143,3 +170,4 @@ class SensorManager:
         self.sharp_left_ema = None
         self.sharp_right_ema = None
         self.front_cm = None
+        self.tof_last_update = None
