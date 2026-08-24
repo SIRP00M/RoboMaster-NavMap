@@ -1,200 +1,108 @@
-﻿from robomaster import robot
-from collections import deque
+﻿import time
 import statistics
-import argparse
-import time
-
-
-# ============================================================
-# ARGUMENT
-# ============================================================
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--run", action="store_true")
-args = parser.parse_args()
-
-ENABLE_MOTION = args.run
-
+from collections import deque
+from robomaster import robot
 
 # ============================================================
-# SENSOR POSITION
+# CONFIGURATION & PARAMETERS
 # ============================================================
+ENABLE_MOTION = True
 
-LF_ID = 1
-LR_ID = 2
-RF_ID = 3
-RR_ID = 4
+# ---------------- SENSOR ID ----------------
+IR_LEFT_ID = 1
+SHARP_LEFT_ID = 2
 
-SHARP_PORT = 1
+SHARP_RIGHT_ID = 3
+IR_RIGHT_ID = 4
 
+SENSOR_PORT = 1
 
-# ============================================================
-# CALIBRATION
-# ============================================================
+# ---------------- DISTANCE ----------------
+TARGET_SIDE_CM = 6.0
+STOP_FRONT_CM = 25.0
 
-CALIBRATION = {
+# ---------------- SPEED ----------------
+FORWARD_SPEED = 0.25
 
-    1: [
-        (591, 5.0),
-        (335, 10.0),
-        (245, 15.0),
-        (204, 20.0),
-        (145, 25.0),
-        (108, 30.0),
-    ],
+# ถ้าหุ่นแก้ทิศผิด ให้สลับ 1 <-> -1
+Y_DIR_SIGN = -1
+Z_DIR_SIGN = -1
 
-    2: [
-        (675, 5.0),
-        (343, 10.0),
-        (236, 15.0),
-        (166, 20.0),
-        (126, 25.0),
-        (105, 30.0),
-    ],
+# ---------------- CONTROLLER ----------------
+KP_STRAFE = 0.015
+KP_ROTATE = 1.5
 
-    3: [
-        (954, 5.0),
-        (643, 10.0),
-        (466, 15.0),
-        (390, 20.0),
-        (326, 25.0),
-        (276, 30.0),
-    ],
+MAX_Y_SPEED = 0.10
+MAX_Z_SPEED = 18.0
 
-    4: [
-        (586, 5.0),
-        (352, 10.0),
-        (246, 15.0),
-        (185, 20.0),
-        (144, 25.0),
-        (102, 30.0),
-    ],
-}
-
+# ถ้าซ้าย-ขวาต่างกันน้อยกว่านี้ ถือว่าตรงแล้ว
+CENTER_DEADBAND_CM = 0.8
 
 # ============================================================
-# FILTER
+# SHARP CALIBRATION
 # ============================================================
 
-MEDIAN_WINDOW = 5
-EMA_ALPHA = 0.35
+CALIBRATION_SHARP_LEFT = [
+    (675, 5.0),
+    (343, 10.0),
+    (236, 15.0),
+    (166, 20.0),
+    (126, 25.0),
+    (105, 30.0)
+]
 
-buffers = {
-    1: deque(maxlen=MEDIAN_WINDOW),
-    2: deque(maxlen=MEDIAN_WINDOW),
-    3: deque(maxlen=MEDIAN_WINDOW),
-    4: deque(maxlen=MEDIAN_WINDOW),
-}
-
-ema = {
-    1: None,
-    2: None,
-    3: None,
-    4: None,
-}
-
-
-# ============================================================
-# DISTANCE SETTINGS
-# ============================================================
-
-# เริ่มหลบกำแพง
-SIDE_TRIGGER_CM = 10.0
-
-# ต้องห่างถึงนี่ถึงจะเลิกหมุน
-SIDE_RELEASE_CM = 12.0
-
-# ถ้าใกล้มาก หมุนแรงขึ้น
-SIDE_DANGER_CM = 7.0
-
-# Front ToF
-FRONT_STOP_CM = 20.0
-FRONT_RELEASE_CM = 23.0
-
+CALIBRATION_SHARP_RIGHT = [
+    (675, 5.0),
+    (343, 10.0),
+    (236, 15.0),
+    (166, 20.0),
+    (126, 25.0),
+    (105, 30.0)
+]
 
 # ============================================================
-# SPEED
+# FILTER BUFFERS
 # ============================================================
 
-FORWARD_SPEED = 0.15
+sharp_left_buffer = deque(maxlen=3)
+sharp_right_buffer = deque(maxlen=3)
 
-TURN_SPEED = 25.0
-DANGER_TURN_SPEED = 35.0
+sharp_left_ema = None
+sharp_right_ema = None
 
-# ตอนเดินตรง ใช้ correction หมุนเล็กน้อย
-# ไม่มี y / strafe
-STRAIGHT_CORRECTION_MAX = 5.0
-
-# ความต่างหน้า-หลังต้องเกินเท่านี้ถึงแก้ heading
-ANGLE_DEADBAND_CM = 2.0
-
-ANGLE_KP = 1.2
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-STATE_FORWARD = "FORWARD"
-STATE_TURN_LEFT = "TURN_LEFT"
-STATE_TURN_RIGHT = "TURN_RIGHT"
-STATE_FRONT_STOP = "FRONT_STOP"
-
-state = STATE_FORWARD
-
-# บังคับให้การเลี้ยวแต่ละครั้งอยู่ขั้นต่ำช่วงหนึ่ง
-# ป้องกัน sensor เปลี่ยนค่าแล้วกลับซ้าย/ขวารัว
-TURN_MIN_TIME = 0.40
-turn_start_time = 0.0
-
+tof_buffer = deque(maxlen=3)
+front_cm = None
 
 # ============================================================
 # TOF
 # ============================================================
 
-tof_buffer = deque(maxlen=5)
-
-front_cm = None
-front_time = 0.0
-
-
 def tof_callback(data):
-
     global front_cm
-    global front_time
 
     try:
-
-        if not data:
+        if not data or data[0] is None:
             return
 
         mm = data[0]
 
-        if mm <= 0:
+        if mm < 20 or mm > 4000:
             return
 
         cm = mm / 10.0
 
         tof_buffer.append(cm)
-
         front_cm = statistics.median(tof_buffer)
-        front_time = time.time()
 
-    except:
-        pass
+    except Exception as e:
+        print("ToF callback error:", e)
 
 
 # ============================================================
-# UTILITY
+# SHARP CONVERSION
 # ============================================================
 
-def clamp(v, mn, mx):
-    return max(mn, min(mx, v))
-
-
-def adc_to_cm(sensor_id, adc):
-
-    table = CALIBRATION[sensor_id]
+def adc_to_cm(adc, table):
 
     if adc >= table[0][0]:
         return 5.0
@@ -216,100 +124,220 @@ def adc_to_cm(sensor_id, adc):
     return 30.0
 
 
-def read_sharp(sensor, sensor_id):
+# ============================================================
+# READ SHARP LEFT
+# ============================================================
 
-    raw = sensor.get_adc(
-        id=sensor_id,
-        port=SHARP_PORT
+def read_sharp_left(sensor_adapter):
+
+    global sharp_left_ema
+
+    raw = sensor_adapter.get_adc(
+        id=SHARP_LEFT_ID,
+        port=SENSOR_PORT
     )
 
-    buffers[sensor_id].append(raw)
+    sharp_left_buffer.append(raw)
 
-    med = statistics.median(
-        buffers[sensor_id]
-    )
+    median_adc = statistics.median(sharp_left_buffer)
 
-    if ema[sensor_id] is None:
-        ema[sensor_id] = med
-
+    if sharp_left_ema is None:
+        sharp_left_ema = median_adc
     else:
-
-        ema[sensor_id] = (
-            EMA_ALPHA * med
-            +
-            (1.0 - EMA_ALPHA) * ema[sensor_id]
+        sharp_left_ema = (
+            0.6 * median_adc
+            + 0.4 * sharp_left_ema
         )
 
     cm = adc_to_cm(
-        sensor_id,
-        ema[sensor_id]
+        sharp_left_ema,
+        CALIBRATION_SHARP_LEFT
     )
 
-    return cm
-
-
-def fmt(v):
-
-    if v is None:
-        return "---"
-
-    return f"{v:4.1f}"
+    return raw, cm
 
 
 # ============================================================
-# STRAIGHT HEADING CORRECTION
-#
-# ไม่มีแกน y
-# ใช้แค่ z เล็กน้อยเพื่อพยายามให้ขนานกับกำแพง
+# READ SHARP RIGHT
 # ============================================================
 
-def straight_heading_correction(lf, lr, rf, rr):
+def read_sharp_right(sensor_adapter):
 
-    corrections = []
+    global sharp_right_ema
 
-
-    # ---------------- LEFT ----------------
-
-    # ใช้เฉพาะตอนกำแพงอยู่ใกล้พอให้เชื่อถือได้
-    if max(lf, lr) < 20.0:
-
-        diff = lf - lr
-
-        if abs(diff) > ANGLE_DEADBAND_CM:
-
-            corrections.append(
-                ANGLE_KP * diff
-            )
-
-
-    # ---------------- RIGHT ----------------
-
-    if max(rf, rr) < 20.0:
-
-        diff = rf - rr
-
-        if abs(diff) > ANGLE_DEADBAND_CM:
-
-            corrections.append(
-                -ANGLE_KP * diff
-            )
-
-
-    if not corrections:
-        return 0.0
-
-
-    z = sum(corrections) / len(corrections)
-
-    return clamp(
-        z,
-        -STRAIGHT_CORRECTION_MAX,
-        STRAIGHT_CORRECTION_MAX
+    raw = sensor_adapter.get_adc(
+        id=SHARP_RIGHT_ID,
+        port=SENSOR_PORT
     )
 
+    sharp_right_buffer.append(raw)
+
+    median_adc = statistics.median(sharp_right_buffer)
+
+    if sharp_right_ema is None:
+        sharp_right_ema = median_adc
+    else:
+        sharp_right_ema = (
+            0.6 * median_adc
+            + 0.4 * sharp_right_ema
+        )
+
+    cm = adc_to_cm(
+        sharp_right_ema,
+        CALIBRATION_SHARP_RIGHT
+    )
+
+    return raw, cm
+
 
 # ============================================================
-# ROBOT
+# READ IR
+# ============================================================
+
+def read_ir(sensor_adapter, sensor_id):
+
+    try:
+
+        return sensor_adapter.get_io_level(
+            id=sensor_id,
+            port=SENSOR_PORT
+        )
+
+    except Exception:
+
+        raw = sensor_adapter.get_adc(
+            id=sensor_id,
+            port=SENSOR_PORT
+        )
+
+        return 1 if raw > 300 else 0
+
+
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def clamp(val, min_val, max_val):
+    return max(min_val, min(max_val, val))
+
+
+def fmt(val):
+    return "---" if val is None else f"{val:4.1f}"
+
+
+# ============================================================
+# CORRIDOR CENTERING CONTROLLER
+# ============================================================
+
+def calculate_corridor_control(
+    left_cm,
+    right_cm,
+    ir_left,
+    ir_right
+):
+
+    if left_cm is None or right_cm is None:
+        return 0.0, 0.0
+
+    # --------------------------------------------------------
+    # CASE 1: มีกำแพงทั้งสองฝั่ง
+    #
+    # ถ้า Left > Right
+    # = หุ่นอยู่ใกล้ฝั่งขวา
+    # = ต้องขยับไปทางซ้าย
+    #
+    # ถ้า Right > Left
+    # = หุ่นอยู่ใกล้ฝั่งซ้าย
+    # = ต้องขยับไปทางขวา
+    # --------------------------------------------------------
+
+    if ir_left and ir_right:
+
+        error = left_cm - right_cm
+
+        if abs(error) <= CENTER_DEADBAND_CM:
+            return 0.0, 0.0
+
+        y_cmd = clamp(
+            error * KP_STRAFE * Y_DIR_SIGN,
+            -MAX_Y_SPEED,
+            MAX_Y_SPEED
+        )
+
+        z_cmd = clamp(
+            error * KP_ROTATE * Z_DIR_SIGN,
+            -MAX_Z_SPEED,
+            MAX_Z_SPEED
+        )
+
+        return y_cmd, z_cmd
+
+
+    # --------------------------------------------------------
+    # CASE 2: มีกำแพงเฉพาะซ้าย
+    # Follow Left Wall
+    # --------------------------------------------------------
+
+    elif ir_left and not ir_right:
+
+        error = left_cm - TARGET_SIDE_CM
+
+        if abs(error) <= CENTER_DEADBAND_CM:
+            return 0.0, 0.0
+
+        y_cmd = clamp(
+            -error * KP_STRAFE * Y_DIR_SIGN,
+            -MAX_Y_SPEED,
+            MAX_Y_SPEED
+        )
+
+        z_cmd = clamp(
+            -error * KP_ROTATE * Z_DIR_SIGN,
+            -MAX_Z_SPEED,
+            MAX_Z_SPEED
+        )
+
+        return y_cmd, z_cmd
+
+
+    # --------------------------------------------------------
+    # CASE 3: มีกำแพงเฉพาะขวา
+    # Follow Right Wall
+    # --------------------------------------------------------
+
+    elif ir_right and not ir_left:
+
+        error = right_cm - TARGET_SIDE_CM
+
+        if abs(error) <= CENTER_DEADBAND_CM:
+            return 0.0, 0.0
+
+        y_cmd = clamp(
+            error * KP_STRAFE * Y_DIR_SIGN,
+            -MAX_Y_SPEED,
+            MAX_Y_SPEED
+        )
+
+        z_cmd = clamp(
+            error * KP_ROTATE * Z_DIR_SIGN,
+            -MAX_Z_SPEED,
+            MAX_Z_SPEED
+        )
+
+        return y_cmd, z_cmd
+
+
+    # --------------------------------------------------------
+    # CASE 4: ไม่มีกำแพงทั้งสองด้าน
+    # วิ่งตรงไป
+    # --------------------------------------------------------
+
+    else:
+        return 0.0, 0.0
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 ep_robot = robot.Robot()
@@ -323,258 +351,96 @@ try:
     )
 
     chassis = ep_robot.chassis
-    sensor = ep_robot.sensor_adaptor
-    tof = ep_robot.sensor
+    sensor_adapter = ep_robot.sensor_adaptor
+    tof_sensor = ep_robot.sensor
 
-
-    tof.sub_distance(
+    tof_sensor.sub_distance(
         freq=20,
         callback=tof_callback
     )
 
-
     print()
-    print("==============================")
-    print(" SIMPLE WALL AVOIDANCE")
-    print("==============================")
-
-    if ENABLE_MOTION:
-        print("MOTION ENABLED")
-    else:
-        print("DRY RUN - ROBOT WILL NOT MOVE")
-        print("Use: python wall_avoidance_simple.py --run")
-
+    print("======================================")
+    print("       CORRIDOR CENTERING MODE")
+    print("======================================")
     print()
 
-    time.sleep(1)
+    time.sleep(1.0)
 
+    stop_confirm_count = 0
 
     while True:
 
-        # ====================================================
-        # READ SHARP
-        # ====================================================
+        # ----------------------------------------------------
+        # READ SENSOR
+        # ----------------------------------------------------
 
-        lf = read_sharp(sensor, LF_ID)
-        lr = read_sharp(sensor, LR_ID)
+        raw_left, left_cm = read_sharp_left(
+            sensor_adapter
+        )
 
-        rf = read_sharp(sensor, RF_ID)
-        rr = read_sharp(sensor, RR_ID)
+        raw_right, right_cm = read_sharp_right(
+            sensor_adapter
+        )
 
+        ir_left = read_ir(
+            sensor_adapter,
+            IR_LEFT_ID
+        )
 
-        # ใช้ค่าที่ใกล้ที่สุด
-        # เพราะถ้าหน้าหรือหลังด้านใดด้านหนึ่งใกล้กำแพง
-        # เราต้องถือว่าอันตราย
-        left_min = min(lf, lr)
-        right_min = min(rf, rr)
-
-
-        # ====================================================
-        # COMMAND DEFAULT
-        # ====================================================
+        ir_right = read_ir(
+            sensor_adapter,
+            IR_RIGHT_ID
+        )
 
         x = 0.0
         y = 0.0
         z = 0.0
 
+        # ----------------------------------------------------
+        # FRONT STOP
+        # ----------------------------------------------------
 
-        # ====================================================
-        # FRONT SAFETY
-        # ====================================================
-
-        tof_valid = (
+        if (
             front_cm is not None
-            and
-            time.time() - front_time < 1.0
-        )
+            and 0.0 < front_cm <= STOP_FRONT_CM
+        ):
 
+            stop_confirm_count += 1
 
-        if not tof_valid:
+            if stop_confirm_count >= 3:
 
-            state = STATE_FRONT_STOP
-
-
-        elif state == STATE_FRONT_STOP:
-
-            # ต้องโล่ง 13 cm ถึงเดินต่อ
-            if front_cm >= FRONT_RELEASE_CM:
-
-                state = STATE_FORWARD
-
-            else:
-
-                x = 0.0
-                y = 0.0
-                z = 0.0
-
-
-        elif front_cm <= FRONT_STOP_CM:
-
-            state = STATE_FRONT_STOP
-
-            x = 0.0
-            y = 0.0
-            z = 0.0
-
-
-        # ====================================================
-        # TURN RIGHT STATE
-        # ====================================================
-
-        elif state == STATE_TURN_RIGHT:
-
-            elapsed = time.time() - turn_start_time
-
-            # ยังอยู่ใกล้กำแพง
-            # หรือยังหมุนไม่ครบ minimum time
-            if (
-                left_min < SIDE_RELEASE_CM
-                or
-                elapsed < TURN_MIN_TIME
-            ):
-
-                x = 0.0
-                y = 0.0
-
-                if left_min <= SIDE_DANGER_CM:
-                    z = -DANGER_TURN_SPEED
-                else:
-                    z = -TURN_SPEED
-
-            else:
-
-                state = STATE_FORWARD
-
-
-        # ====================================================
-        # TURN LEFT STATE
-        # ====================================================
-
-        elif state == STATE_TURN_LEFT:
-
-            elapsed = time.time() - turn_start_time
-
-            if (
-                right_min < SIDE_RELEASE_CM
-                or
-                elapsed < TURN_MIN_TIME
-            ):
-
-                x = 0.0
-                y = 0.0
-
-                if right_min <= SIDE_DANGER_CM:
-                    z = DANGER_TURN_SPEED
-                else:
-                    z = TURN_SPEED
-
-            else:
-
-                state = STATE_FORWARD
-
-
-        # ====================================================
-        # FORWARD
-        # ====================================================
-
-        if state == STATE_FORWARD:
-
-            # -----------------------------------------------
-            # BOTH SIDES TOO CLOSE
-            # -----------------------------------------------
-
-            if (
-                left_min <= SIDE_TRIGGER_CM
-                and
-                right_min <= SIDE_TRIGGER_CM
-            ):
-
-                # เลือกหนีฝั่งที่ใกล้กว่า
-                if left_min < right_min - 1.0:
-
-                    state = STATE_TURN_RIGHT
-                    turn_start_time = time.time()
-
-                    x = 0.0
-                    y = 0.0
-                    z = -TURN_SPEED
-
-                elif right_min < left_min - 1.0:
-
-                    state = STATE_TURN_LEFT
-                    turn_start_time = time.time()
-
-                    x = 0.0
-                    y = 0.0
-                    z = TURN_SPEED
-
-                else:
-
-                    # แคบทั้งสองข้างพอ ๆ กัน
-                    # อย่าตัดสินใจซ้ายขวารัว ๆ
-                    x = 0.0
-                    y = 0.0
-                    z = 0.0
-
-
-            # -----------------------------------------------
-            # LEFT TOO CLOSE
-            # -----------------------------------------------
-
-            elif left_min <= SIDE_TRIGGER_CM:
-
-                state = STATE_TURN_RIGHT
-                turn_start_time = time.time()
-
-                x = 0.0
-                y = 0.0
-
-                if left_min <= SIDE_DANGER_CM:
-                    z = -DANGER_TURN_SPEED
-                else:
-                    z = -TURN_SPEED
-
-
-            # -----------------------------------------------
-            # RIGHT TOO CLOSE
-            # -----------------------------------------------
-
-            elif right_min <= SIDE_TRIGGER_CM:
-
-                state = STATE_TURN_LEFT
-                turn_start_time = time.time()
-
-                x = 0.0
-                y = 0.0
-
-                if right_min <= SIDE_DANGER_CM:
-                    z = DANGER_TURN_SPEED
-                else:
-                    z = TURN_SPEED
-
-
-            # -----------------------------------------------
-            # CLEAR -> GO STRAIGHT
-            # -----------------------------------------------
-
-            else:
-
-                x = FORWARD_SPEED
-
-                # สำคัญ:
-                # ไม่มี strafe
-                y = 0.0
-
-                # แค่หมุนเล็กน้อยเพื่อให้ขนาน
-                z = straight_heading_correction(
-                    lf, lr,
-                    rf, rr
+                print()
+                print(
+                    f"[STOP] Front wall "
+                    f"{front_cm:.1f} cm"
                 )
 
+                chassis.drive_speed(
+                    x=0,
+                    y=0,
+                    z=0,
+                    timeout=0.1
+                )
 
-        # ====================================================
-        # SEND
-        # ====================================================
+                break
+
+        else:
+
+            stop_confirm_count = 0
+
+            x = FORWARD_SPEED
+
+            y, z = calculate_corridor_control(
+                left_cm,
+                right_cm,
+                ir_left,
+                ir_right
+            )
+
+        # ----------------------------------------------------
+        # DRIVE
+        # ----------------------------------------------------
 
         if ENABLE_MOTION:
 
@@ -582,34 +448,43 @@ try:
                 x=x,
                 y=y,
                 z=z,
-                timeout=0.3
+                timeout=0.15
             )
 
+        # ----------------------------------------------------
+        # DEBUG
+        # ----------------------------------------------------
 
-        # ====================================================
-        # DISPLAY
-        # ====================================================
-
-        print(
-            f"Front:{fmt(front_cm)} | "
-            f"LF:{fmt(lf)} LR:{fmt(lr)} | "
-            f"RF:{fmt(rf)} RR:{fmt(rr)} | "
-            f"Lmin:{fmt(left_min)} "
-            f"Rmin:{fmt(right_min)} | "
-            f"x={x:+.2f} "
-            f"y={y:+.2f} "
-            f"z={z:+.1f} | "
-            f"{state}"
+        center_error = (
+            left_cm - right_cm
+            if left_cm is not None
+            and right_cm is not None
+            else 0
         )
 
+        print(
+            f"ToF:{fmt(front_cm)}cm | "
+            f"L:{fmt(left_cm)}cm ADC:{raw_left:3d} "
+            f"IR:{ir_left} | "
+            f"R:{fmt(right_cm)}cm ADC:{raw_right:3d} "
+            f"IR:{ir_right} | "
+            f"Err:{center_error:+5.1f} | "
+            f"Cmd x={x:.2f} "
+            f"y={y:+.2f} "
+            f"z={z:+.1f}"
+        )
 
         time.sleep(0.05)
 
 
 except KeyboardInterrupt:
 
-    print()
-    print("STOP")
+    print("\nSTOP REQUESTED BY USER")
+
+
+except Exception as e:
+
+    print("\nERROR:", e)
 
 
 finally:
@@ -625,10 +500,10 @@ finally:
         pass
 
     try:
-        tof.unsub_distance()
+        tof_sensor.unsub_distance()
     except:
         pass
 
     ep_robot.close()
 
-    print("Robot stopped.")
+    print("Robot stopped and disconnected.")
