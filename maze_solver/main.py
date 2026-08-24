@@ -52,8 +52,11 @@ def print_startup_info():
     print(f"Rearm Distance      : {config.JUNCTION_REARM_DISTANCE_M:.2f} m")
     print(f"Edge Max Visits     : {config.MAX_EDGE_VISITS}")
     print(f"DFS Preference      : {config.EXPLORATION_PREFERENCE}")
-    print(f"Junction Creep      : {config.ENABLE_JUNCTION_CREEP}")
+    print(f"Junction Creep      : {config.ENABLE_JUNCTION_CREEP} ({config.JUNCTION_CREEP_DISTANCE_M:.2f} m)")
+    print(f"Corner Turn Setup   : {config.ENABLE_CORNER_TURN_SETUP} (ToF->{config.CORNER_TURN_FRONT_TARGET_CM:.1f} cm, {config.CORNER_TURN_SETUP_DISTANCE_M:.2f} m max)")
+    print(f"Post-turn Clearance : {config.ENABLE_POST_TURN_CLEARANCE} (release>{config.POST_TURN_CLEARANCE_RELEASE_CM:.1f} cm)")
     print(f"Yaw Correction      : {config.ENABLE_YAW_CORRECTION}")
+    print(f"Feedback Turn       : {config.ENABLE_FEEDBACK_TURN} (no unbounded SDK wait)")
     print(f"Heading Hold        : {config.ENABLE_HEADING_HOLD}")
     print(f"Move Z -> Yaw Sign  : {config.DEFAULT_MOVE_TO_YAW_SIGN:+d}")
     print(f"Drive Z -> Yaw Sign : {config.DEFAULT_DRIVE_TO_YAW_SIGN:+d}")
@@ -194,6 +197,18 @@ def scan_decision_point(detector, sensors):
     }
 
 
+def _pose_xy(pose_tracker):
+    x, y, _ = pose_tracker.get_pose()
+    return x, y
+
+
+def _travelled_m(start_x, start_y, pose_tracker):
+    x, y = _pose_xy(pose_tracker)
+    if start_x is None or start_y is None or x is None or y is None:
+        return None
+    return ((x - start_x) ** 2 + (y - start_y) ** 2) ** 0.5
+
+
 def creep_to_junction_center(
     chassis,
     sensors,
@@ -203,10 +218,11 @@ def creep_to_junction_center(
     left_open,
     right_open,
 ):
-    """Move a few centimetres into a side-opening junction before turning.
+    """Move into the centre of a front-open side junction.
 
-    We only creep when the front was confirmed open. A front wall immediately
-    disables this behavior, so dead ends/corners do not move closer to the wall.
+    V6 uses travelled distance rather than a fixed 0.50 s. This makes the
+    physical offset much more repeatable when battery/load/traction changes.
+    Corners with a non-open front are handled later by corner_turn_setup().
     """
     if not config.ENABLE_JUNCTION_CREEP:
         return
@@ -218,14 +234,16 @@ def creep_to_junction_center(
         print("JUNCTION_CREEP skipped: motion disabled")
         return
 
+    start_x, start_y = _pose_xy(pose_tracker)
+    start_time = time.monotonic()
+
     print(
         f">>> JUNCTION_CREEP speed={config.JUNCTION_CREEP_SPEED:.2f} m/s "
-        f"max={config.JUNCTION_CREEP_SEC:.2f}s"
+        f"target={config.JUNCTION_CREEP_DISTANCE_M:.2f}m "
+        f"max={config.JUNCTION_CREEP_MAX_SEC:.2f}s"
     )
 
-    deadline = time.monotonic() + config.JUNCTION_CREEP_SEC
-
-    while time.monotonic() < deadline:
+    while time.monotonic() - start_time < config.JUNCTION_CREEP_MAX_SEC:
         front_cm = sensors.get_front_cm()
 
         if front_cm is None:
@@ -237,6 +255,14 @@ def creep_to_junction_center(
                 f"JUNCTION_CREEP abort: front={front_cm:.1f} cm "
                 f"<= {config.JUNCTION_CREEP_ABORT_FRONT_CM:.1f} cm"
             )
+            break
+
+        travelled = _travelled_m(start_x, start_y, pose_tracker)
+        if (
+            travelled is not None
+            and travelled >= config.JUNCTION_CREEP_DISTANCE_M
+        ):
+            print(f"JUNCTION_CREEP done: travelled={travelled:.3f} m")
             break
 
         creep_x, creep_y, creep_z, _, _ = controller.apply_heading_hold(
@@ -254,6 +280,218 @@ def creep_to_junction_center(
             timeout=config.DRIVE_TIMEOUT_SEC,
         )
         time.sleep(config.JUNCTION_CREEP_LOOP_SEC)
+
+    stop_chassis(chassis)
+
+
+def corner_turn_setup(
+    chassis,
+    sensors,
+    controller,
+    pose_tracker,
+    relative_direction,
+    front_open,
+):
+    """Advance a little farther before a LEFT/RIGHT corner turn.
+
+    This fixes the V5 failure mode where a side opening is found while the
+    front is not traversable. V5 skipped junction creep in that situation and
+    rotated immediately, so the chassis could pivot before reaching the corner
+    centre and clip the inside wall.
+
+    Motion stops on whichever occurs first:
+      * odometry reaches CORNER_TURN_SETUP_DISTANCE_M,
+      * front ToF reaches CORNER_TURN_FRONT_TARGET_CM,
+      * hard-stop distance is reached,
+      * timeout / missing ToF.
+    """
+    if not config.ENABLE_CORNER_TURN_SETUP:
+        return
+
+    if relative_direction not in ("LEFT", "RIGHT"):
+        return
+
+    # A front-open junction has already been centred by JUNCTION_CREEP.
+    if front_open:
+        return
+
+    if not config.ENABLE_MOTION:
+        print("TURN_SETUP skipped: motion disabled")
+        return
+
+    start_x, start_y = _pose_xy(pose_tracker)
+    start_time = time.monotonic()
+    start_front = sensors.get_front_cm()
+
+    print(
+        f">>> TURN_SETUP {relative_direction} "
+        f"speed={config.CORNER_TURN_SETUP_SPEED:.2f} m/s "
+        f"target_move={config.CORNER_TURN_SETUP_DISTANCE_M:.2f}m "
+        f"front_target={config.CORNER_TURN_FRONT_TARGET_CM:.1f}cm "
+        f"start_front={start_front if start_front is not None else 'None'}"
+    )
+
+    while time.monotonic() - start_time < config.CORNER_TURN_SETUP_MAX_SEC:
+        front_cm = sensors.get_front_cm()
+
+        if front_cm is None:
+            print("TURN_SETUP abort: ToF unavailable")
+            break
+
+        if front_cm <= config.CORNER_TURN_FRONT_HARD_STOP_CM:
+            print(
+                f"TURN_SETUP HARD STOP: front={front_cm:.1f} cm "
+                f"<= {config.CORNER_TURN_FRONT_HARD_STOP_CM:.1f} cm"
+            )
+            break
+
+        if front_cm <= config.CORNER_TURN_FRONT_TARGET_CM:
+            print(f"TURN_SETUP done: front target reached ({front_cm:.1f} cm)")
+            break
+
+        travelled = _travelled_m(start_x, start_y, pose_tracker)
+        if (
+            travelled is not None
+            and travelled >= config.CORNER_TURN_SETUP_DISTANCE_M
+        ):
+            print(f"TURN_SETUP done: travelled={travelled:.3f} m")
+            break
+
+        x_cmd, y_cmd, z_cmd, _, _ = controller.apply_heading_hold(
+            config.CORNER_TURN_SETUP_SPEED,
+            0.0,
+            pose_tracker.get_yaw(),
+            pose_tracker,
+            "TURN_SETUP",
+        )
+
+        chassis.drive_speed(
+            x=x_cmd,
+            y=y_cmd,
+            z=z_cmd,
+            timeout=config.DRIVE_TIMEOUT_SEC,
+        )
+        time.sleep(config.CORNER_TURN_SETUP_LOOP_SEC)
+
+    stop_chassis(chassis)
+
+
+def post_turn_clearance(
+    chassis,
+    sensors,
+    controller,
+    pose_tracker,
+    relative_direction,
+):
+    """Crawl clear of the inside corner after a LEFT/RIGHT turn.
+
+    If the inner-side Sharp sensor still sees the old corner wall very close,
+    move forward slowly while adding a small outward strafe.  This prevents
+    resuming 0.15 m/s while the rear/side of the chassis is still beside the
+    corner edge.
+    """
+    if not config.ENABLE_POST_TURN_CLEARANCE:
+        return
+    if relative_direction not in ("LEFT", "RIGHT"):
+        return
+    if not config.ENABLE_MOTION:
+        return
+
+    # Flush pre-turn Sharp history so the first post-turn values are not mixed
+    # with the geometry before rotation.
+    sensors.reset_filters()
+
+    read_inner = (
+        sensors.read_left_sharp
+        if relative_direction == "LEFT"
+        else sensors.read_right_sharp
+    )
+
+    # Same outward directions used by ESCAPE_LEFT / ESCAPE_RIGHT.
+    y_out = (
+        +config.POST_TURN_CLEARANCE_Y_SPEED * config.Y_DIR_SIGN
+        if relative_direction == "LEFT"
+        else -config.POST_TURN_CLEARANCE_Y_SPEED * config.Y_DIR_SIGN
+    )
+
+    # Let the Sharp filter get a couple of fresh samples after the turn.
+    inner_cm = None
+    for _ in range(2):
+        _, inner_cm = read_inner()
+        time.sleep(config.POST_TURN_CLEARANCE_LOOP_SEC)
+
+    if inner_cm is None:
+        print("POST_TURN_CLEARANCE skipped: inner Sharp unavailable")
+        return
+
+    if inner_cm > config.POST_TURN_CLEARANCE_TRIGGER_CM:
+        print(
+            f"POST_TURN_CLEARANCE not needed: {relative_direction} "
+            f"inner={inner_cm:.1f} cm"
+        )
+        return
+
+    start_x, start_y = _pose_xy(pose_tracker)
+    start_time = time.monotonic()
+
+    print(
+        f">>> POST_TURN_CLEARANCE {relative_direction} "
+        f"inner={inner_cm:.1f}cm "
+        f"release={config.POST_TURN_CLEARANCE_RELEASE_CM:.1f}cm"
+    )
+
+    while time.monotonic() - start_time < config.POST_TURN_CLEARANCE_MAX_SEC:
+        front_cm = sensors.get_front_cm()
+        if front_cm is None:
+            # reset_filters() also clears ToF; wait for a fresh callback before
+            # allowing any post-turn translation.
+            stop_chassis(chassis)
+            time.sleep(config.POST_TURN_CLEARANCE_LOOP_SEC)
+            continue
+
+        if front_cm <= config.POST_TURN_CLEARANCE_FRONT_STOP_CM:
+            print(
+                f"POST_TURN_CLEARANCE stop: front={front_cm:.1f} cm"
+            )
+            break
+
+        _, inner_cm = read_inner()
+        if inner_cm is None:
+            print("POST_TURN_CLEARANCE abort: inner Sharp unavailable")
+            break
+
+        if inner_cm >= config.POST_TURN_CLEARANCE_RELEASE_CM:
+            print(
+                f"POST_TURN_CLEARANCE done: inner={inner_cm:.1f} cm"
+            )
+            break
+
+        travelled = _travelled_m(start_x, start_y, pose_tracker)
+        if (
+            travelled is not None
+            and travelled >= config.POST_TURN_CLEARANCE_MAX_DISTANCE_M
+        ):
+            print(
+                f"POST_TURN_CLEARANCE done: travelled={travelled:.3f} m, "
+                f"inner={inner_cm:.1f} cm"
+            )
+            break
+
+        x_cmd, y_cmd, z_cmd, _, _ = controller.apply_heading_hold(
+            config.POST_TURN_CLEARANCE_FORWARD_SPEED,
+            y_out,
+            pose_tracker.get_yaw(),
+            pose_tracker,
+            "POST_TURN_CLEARANCE",
+        )
+
+        chassis.drive_speed(
+            x=x_cmd,
+            y=y_cmd,
+            z=z_cmd,
+            timeout=config.DRIVE_TIMEOUT_SEC,
+        )
+        time.sleep(config.POST_TURN_CLEARANCE_LOOP_SEC)
 
     stop_chassis(chassis)
 
@@ -481,11 +719,34 @@ def main():
                     exploration_decision.direction
                 )
 
-                execute_turn(
+                # V6: for a real corner (front not traversable + side turn),
+                # advance the chassis a few centimetres before rotating so the
+                # pivot is closer to the physical centre of the corner.
+                corner_turn_setup(
+                    chassis,
+                    sensors,
+                    controller,
+                    pose_tracker,
+                    exploration_decision.direction,
+                    scan["front_open"],
+                )
+
+                turn_ok = execute_turn(
                     chassis,
                     turn_decision,
                     pose_tracker=pose_tracker,
                 )
+
+                if not turn_ok:
+                    stop_chassis(chassis)
+                    print()
+                    print("============================================")
+                    print(" TURN FAILED SAFELY - MAP EDGE NOT COMMITTED")
+                    print(" Check yaw / chassis communication, then retry.")
+                    print("============================================")
+                    if config.SAVE_MAZE_MEMORY:
+                        explorer.save_memory()
+                    break
 
                 # Mark the edge only after physical turn succeeds.
                 explorer.commit_decision(exploration_decision)
@@ -499,6 +760,18 @@ def main():
                 )
                 align_heading_in_place(chassis, controller, pose_tracker)
 
+                # V8: the 90-degree rotation can finish while the inside side
+                # of the chassis is still beside the old corner wall.  Crawl
+                # clear before resuming normal corridor speed.
+                controller.reset_after_turn()
+                post_turn_clearance(
+                    chassis,
+                    sensors,
+                    controller,
+                    pose_tracker,
+                    exploration_decision.direction,
+                )
+
                 print(
                     "Updated Memory:",
                     explorer.describe_node(node_id),
@@ -511,8 +784,11 @@ def main():
                 # Clear stale ranges. Junction detector remains locked to this
                 # node but can now re-arm by distance/corridor/timeout/emergency.
                 sensors.reset_filters()
-                controller.reset_after_turn()
-                detector.force_latched(pose_x, pose_y)
+                latch_x, latch_y = _pose_xy(pose_tracker)
+                detector.force_latched(
+                    latch_x if latch_x is not None else pose_x,
+                    latch_y if latch_y is not None else pose_y,
+                )
 
                 stop_chassis(chassis)
                 time.sleep(config.AFTER_TURN_DELAY_SEC)

@@ -65,14 +65,14 @@ RoboMaster Maze Solver - Robust Trémaux / DFS Version
 2. TARGET_LEFT_CM / TARGET_RIGHT_CM
 3. SIDE_WALL_ENTER_CM / SIDE_WALL_EXIT_CM
 4. EXPLORATION_SIDE_OPEN_CM
-5. JUNCTION_CREEP_SPEED / JUNCTION_CREEP_SEC
+5. JUNCTION_CREEP_SPEED / JUNCTION_CREEP_DISTANCE_M
 6. JUNCTION_REARM_DISTANCE_M
 7. NODE_MATCH_RADIUS_M
 
 ค่าเริ่มต้น Junction Creep
 --------------------------
 JUNCTION_CREEP_SPEED = 0.07 m/s
-JUNCTION_CREEP_SEC   = 0.50 s
+JUNCTION_CREEP_DISTANCE_M = 0.06 m
 
 ระยะเชิงทฤษฎีประมาณ 3.5 cm ก่อนหัก slip/acceleration
 ถ้าเลี้ยวก่อนถึงกลางทางแยก ให้เพิ่มทีละน้อย เช่น 0.55 / 0.60 s
@@ -132,3 +132,24 @@ V5 heading-sign fix
 - ลด heading gain/max z เพื่อให้ correction นุ่มขึ้น
 
 ถ้า log แสดง target > current แต่ +z ทำให้ yaw ลด ให้สลับ DEFAULT_DRIVE_TO_YAW_SIGN ใน config.py
+
+V6 corner-turn fix
+------------------
+- Front-open junction creep now uses odometry distance (default 0.06 m), not only fixed time.
+- LEFT/RIGHT corners where front is not traversable get TURN_SETUP before rotation.
+- TURN_SETUP moves at 0.05 m/s, max 0.07 m, but stops early at front ToF 13 cm and has 10 cm hard stop.
+- Junction latch origin is taken after turn/setup, reducing premature re-arm caused by pre-turn nudging.
+
+V7 TURN HANG FIX
+----------------
+- Normal LEFT/RIGHT/BACK turns no longer use chassis.move().wait_for_completed().
+- They use attitude yaw + drive_speed(z) closed-loop with a hard watchdog.
+- If yaw feedback is unavailable, action fallback uses wait_for_completed(timeout=...).
+- No code path uses wait_for_completed() without a timeout.
+- If a turn cannot finish inside the watchdog, the robot stops and the Trémaux edge is NOT committed.
+
+V8 corner-clearance changes
+---------------------------
+- Corner TURN_SETUP now allows up to 0.14 m instead of 0.07 m and primarily aims for front ToF ~= 14 cm before a 90-degree turn.
+- Added POST_TURN_CLEARANCE. If the inner Sharp side is still <= 6.5 cm after LEFT/RIGHT, the robot crawls forward at 0.045 m/s with a small outward strafe until >= 7.5 cm, 0.07 m travel, 1.5 s, or front safety stop.
+- Feedback yaw turn from V7 remains unchanged.

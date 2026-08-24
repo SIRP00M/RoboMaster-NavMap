@@ -160,9 +160,35 @@ HEADING_ALIGN_LOOP_SEC = 0.04
 # เจอช่องด้านข้างขณะด้านหน้ายังโล่ง -> ค่อย ๆ เข้าไปกลาง junction ก่อน scan/turn
 ENABLE_JUNCTION_CREEP = True
 JUNCTION_CREEP_SPEED = 0.07
-JUNCTION_CREEP_SEC = 0.50
+# V6: ใช้ระยะ odometry แทนเวลาคงที่ เพื่อให้เข้า junction ลึกสม่ำเสมอ
+JUNCTION_CREEP_DISTANCE_M = 0.06
+JUNCTION_CREEP_MAX_SEC = 1.20
 JUNCTION_CREEP_ABORT_FRONT_CM = 16.0
 JUNCTION_CREEP_LOOP_SEC = 0.05
+
+# V6: กรณีโค้งจริง (ด้านหน้าไม่ใช่ทางตรง แต่ LEFT/RIGHT เปิด)
+# V5 จะหมุนทันที ทำให้ pivot อยู่ก่อนถึงศูนย์กลางมุมและท้ายหุ่นกวาดชนมุมใน
+ENABLE_CORNER_TURN_SETUP = True
+CORNER_TURN_SETUP_SPEED = 0.05
+CORNER_TURN_SETUP_DISTANCE_M = 0.14
+CORNER_TURN_SETUP_MAX_SEC = 3.00
+# หยุดดันหน้าเมื่อ ToF ถึงระยะนี้ แม้ odometry ยังไม่ครบ
+CORNER_TURN_FRONT_TARGET_CM = 11.0
+# safety hard stop: ห้ามเข้าใกล้กว่านี้ระหว่างจัดตำแหน่งก่อนหมุน
+CORNER_TURN_FRONT_HARD_STOP_CM = 10.5
+CORNER_TURN_SETUP_LOOP_SEC = 0.04
+
+# V8: after a 90-degree turn, the inside side of the chassis may still be
+# beside the old corner wall. Crawl out of the corner before resuming full speed.
+ENABLE_POST_TURN_CLEARANCE = True
+POST_TURN_CLEARANCE_TRIGGER_CM = 6.5
+POST_TURN_CLEARANCE_RELEASE_CM = 7.5
+POST_TURN_CLEARANCE_FORWARD_SPEED = 0.045
+POST_TURN_CLEARANCE_Y_SPEED = 0.035
+POST_TURN_CLEARANCE_MAX_DISTANCE_M = 0.07
+POST_TURN_CLEARANCE_MAX_SEC = 1.50
+POST_TURN_CLEARANCE_FRONT_STOP_CM = 12.0
+POST_TURN_CLEARANCE_LOOP_SEC = 0.04
 
 # หลังตัดสินใจแล้ว detector จะล็อก junction เดิมไว้ชั่วคราว
 # แต่ปลดได้จากระยะทาง, corridor samples, timeout หรือ emergency front block
@@ -251,3 +277,25 @@ CALIBRATION_SHARP_RIGHT = list(CALIBRATION_SHARP_LEFT)
 
 # backward compatibility
 CALIBRATION_SHARP2 = CALIBRATION_SHARP_LEFT
+
+# ============================================================
+# V7 FEEDBACK TURN / ACTION WATCHDOG
+# ============================================================
+# Normal 90/180 turns use attitude yaw + drive_speed closed-loop so the program
+# does not depend on an SDK action-completion ACK.
+ENABLE_FEEDBACK_TURN = True
+TURN_PRE_SETTLE_SEC = 0.10
+TURN_FEEDBACK_KP = 1.20
+TURN_FEEDBACK_MIN_Z_SPEED = 10.0
+TURN_FEEDBACK_MAX_Z_SPEED = 55.0
+TURN_FEEDBACK_TOLERANCE_DEG = 2.0
+TURN_FEEDBACK_STABLE_SAMPLES = 3
+TURN_FEEDBACK_LOOP_SEC = 0.03
+TURN_FEEDBACK_DRIVE_TIMEOUT_SEC = 0.20
+TURN_FEEDBACK_TIMEOUT_90_SEC = 3.50
+TURN_FEEDBACK_TIMEOUT_180_SEC = 6.00
+TURN_FEEDBACK_PRINT_SEC = 0.25
+
+# Fallback only if attitude yaw is unavailable. Even this path is bounded.
+TURN_ACTION_TIMEOUT_90_SEC = 3.50
+TURN_ACTION_TIMEOUT_180_SEC = 6.00
