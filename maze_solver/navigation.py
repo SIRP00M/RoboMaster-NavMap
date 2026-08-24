@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 import math
 import time
-
 import config
 from pose_tracker import normalize_angle_deg, shortest_angle_error_deg
 
@@ -54,13 +53,6 @@ def _clamp(value, low, high):
 
 
 def _feedback_turn(chassis, decision, pose_tracker):
-    """Closed-loop turn using attitude yaw + drive_speed().
-
-    V7 intentionally avoids chassis.move(...).wait_for_completed() for normal
-    turns because a lost/rejected action-completion ACK can block the program.
-    The turn is instead finished from real attitude feedback and always has a
-    hard watchdog timeout.
-    """
     command_deg = decision.angle_deg * config.Z_DIR_SIGN
     if abs(command_deg) < 0.001:
         return True
@@ -79,10 +71,7 @@ def _feedback_turn(chassis, decision, pose_tracker):
         drive_sign = config.DEFAULT_DRIVE_TO_YAW_SIGN
         pose_tracker.set_drive_to_yaw_sign(drive_sign)
 
-    # Preserve the already field-verified logical turn convention:
-    # RIGHT command=-90 with move_sign=-1 => attitude target +90 deg.
     target_yaw = normalize_angle_deg(start_yaw + command_deg * move_sign)
-
     timeout_sec = (
         config.TURN_FEEDBACK_TIMEOUT_180_SEC
         if abs(command_deg) > 135.0
@@ -96,7 +85,6 @@ def _feedback_turn(chassis, decision, pose_tracker):
 
     _safe_stop(chassis)
     time.sleep(config.TURN_PRE_SETTLE_SEC)
-
     started = time.monotonic()
     stable_samples = 0
     last_print = 0.0
@@ -105,11 +93,10 @@ def _feedback_turn(chassis, decision, pose_tracker):
         while True:
             now = time.monotonic()
             current_yaw = pose_tracker.get_yaw()
-
             if current_yaw is None:
                 if now - started >= timeout_sec:
                     _safe_stop(chassis)
-                    print("TURN FAILED: attitude yaw unavailable until watchdog timeout.")
+                    print("TURN FAILED: yaw unavailable until watchdog timeout.")
                     return False
                 time.sleep(config.TURN_FEEDBACK_LOOP_SEC)
                 continue
@@ -120,42 +107,29 @@ def _feedback_turn(chassis, decision, pose_tracker):
             if abs_error <= config.TURN_FEEDBACK_TOLERANCE_DEG:
                 stable_samples += 1
                 _safe_stop(chassis)
-
                 if stable_samples >= config.TURN_FEEDBACK_STABLE_SAMPLES:
                     time.sleep(config.YAW_SETTLE_SEC)
                     final_yaw = pose_tracker.get_yaw()
-                    final_error = (
-                        shortest_angle_error_deg(target_yaw, final_yaw)
-                        if final_yaw is not None
-                        else error
-                    )
+                    final_error = shortest_angle_error_deg(target_yaw, final_yaw)
                     print(
                         f"TURN OK: yaw={final_yaw:+.1f} target={target_yaw:+.1f} "
                         f"error={final_error:+.1f} deg"
-                        if final_yaw is not None
-                        else "TURN OK"
                     )
                     return True
             else:
                 stable_samples = 0
-
-                speed = abs_error * config.TURN_FEEDBACK_KP
                 speed = _clamp(
-                    speed,
+                    abs_error * config.TURN_FEEDBACK_KP,
                     config.TURN_FEEDBACK_MIN_Z_SPEED,
                     config.TURN_FEEDBACK_MAX_Z_SPEED,
                 )
-
-                # yaw_rate = drive_speed_z * drive_to_yaw_sign
                 z_cmd = math.copysign(speed, error) / drive_sign
-
                 chassis.drive_speed(
                     x=0.0,
                     y=0.0,
                     z=z_cmd,
                     timeout=config.TURN_FEEDBACK_DRIVE_TIMEOUT_SEC,
                 )
-
                 if now - last_print >= config.TURN_FEEDBACK_PRINT_SEC:
                     print(
                         f"    turn yaw={current_yaw:+.1f} target={target_yaw:+.1f} "
@@ -168,22 +142,19 @@ def _feedback_turn(chassis, decision, pose_tracker):
                 final_yaw = pose_tracker.get_yaw()
                 final_error = (
                     shortest_angle_error_deg(target_yaw, final_yaw)
-                    if final_yaw is not None
-                    else None
+                    if final_yaw is not None else None
                 )
                 print(
                     "TURN WATCHDOG TIMEOUT: "
                     + (
                         f"yaw={final_yaw:+.1f} target={target_yaw:+.1f} "
                         f"error={final_error:+.1f} deg"
-                        if final_yaw is not None
-                        else "yaw unavailable"
+                        if final_yaw is not None else "yaw unavailable"
                     )
                 )
                 return False
 
             time.sleep(config.TURN_FEEDBACK_LOOP_SEC)
-
     except KeyboardInterrupt:
         _safe_stop(chassis)
         raise
@@ -194,33 +165,19 @@ def _feedback_turn(chassis, decision, pose_tracker):
 
 
 def _action_turn_with_timeout(chassis, decision, pose_tracker=None):
-    """Finite-time fallback only when attitude feedback is unavailable."""
     command_deg = decision.angle_deg * config.Z_DIR_SIGN
     if abs(command_deg) < 0.001:
         return True
-
-    start_yaw = pose_tracker.get_yaw() if pose_tracker is not None else None
-    print(
-        f">>> TURN {decision.name} [ACTION FALLBACK]: command={command_deg:+.1f} deg"
-        + (f" start_yaw={start_yaw:+.1f}" if start_yaw is not None else "")
-    )
-
-    _safe_stop(chassis)
-    time.sleep(config.TURN_PRE_SETTLE_SEC)
-
     timeout_sec = (
         config.TURN_ACTION_TIMEOUT_180_SEC
         if abs(command_deg) > 135.0
         else config.TURN_ACTION_TIMEOUT_90_SEC
     )
-
+    print(f">>> TURN {decision.name} [ACTION FALLBACK]: command={command_deg:+.1f} deg")
+    _safe_stop(chassis)
+    time.sleep(config.TURN_PRE_SETTLE_SEC)
     try:
-        action = chassis.move(
-            x=0,
-            y=0,
-            z=command_deg,
-            z_speed=config.TURN_SPEED,
-        )
+        action = chassis.move(x=0, y=0, z=command_deg, z_speed=config.TURN_SPEED)
         completed = action.wait_for_completed(timeout=timeout_sec)
     except KeyboardInterrupt:
         _safe_stop(chassis)
@@ -229,27 +186,19 @@ def _action_turn_with_timeout(chassis, decision, pose_tracker=None):
         _safe_stop(chassis)
         print(f"TURN ACTION ERROR: {exc}")
         return False
-
     if not completed:
         _safe_stop(chassis)
         print(f"TURN ACTION TIMEOUT after {timeout_sec:.1f}s - stopped safely.")
         return False
-
     return True
 
 
 def execute_turn(chassis, decision, pose_tracker=None):
-    """Execute a turn without any unbounded SDK wait.
-
-    Returns True on success, False on a safely-aborted turn.
-    """
     if not config.ENABLE_MOTION:
         return True
-
     command_deg = decision.angle_deg * config.Z_DIR_SIGN
     if abs(command_deg) < 0.001:
         return True
-
     if (
         config.ENABLE_FEEDBACK_TURN
         and pose_tracker is not None
@@ -258,6 +207,4 @@ def execute_turn(chassis, decision, pose_tracker=None):
         result = _feedback_turn(chassis, decision, pose_tracker)
         if result is not None:
             return result
-
-    # Never call wait_for_completed() without a timeout.
     return _action_turn_with_timeout(chassis, decision, pose_tracker)

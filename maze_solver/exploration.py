@@ -54,13 +54,7 @@ class ExplorationDecision:
 
 
 class DecisionPointDetector:
-    """Debounce junctions and prevent re-triggering the same physical opening.
-
-    Re-arming no longer depends only on seeing a perfect corridor. The detector
-    can also unlock after the robot has physically moved away from the previous
-    decision point, after a timeout, or early when a new front block appears.
-    This prevents the old FRONT_CONFIRM deadlock.
-    """
+    """Debounce decision points with side-zone hysteresis and robust re-arm."""
 
     def __init__(self):
         self.candidate_count = 0
@@ -71,8 +65,73 @@ class DecisionPointDetector:
         self.latch_y = None
         self.latch_time = None
 
+        # V9 Schmitt-trigger memory. These are ROBOT-RELATIVE states and must
+        # be reset after a physical turn because left/right then see new walls.
+        self.left_open_memory = False
+        self.right_open_memory = False
+        self.last_left_zone = "UNKNOWN"
+        self.last_right_zone = "UNKNOWN"
+
+        # V11 fusion diagnostics.
+        self.last_left_fusion = "INIT"
+        self.last_right_fusion = "INIT"
+        self.last_left_confidence = "LOW"
+        self.last_right_confidence = "LOW"
+
     @staticmethod
-    def classify_openings(front_cm, left_cm, right_cm):
+    def classify_side_zone(distance_cm):
+        if distance_cm is None:
+            return "UNKNOWN"
+        if distance_cm <= config.SIDE_BLOCKED_MAX_CM:
+            return "BLOCKED"
+        if distance_cm >= config.SIDE_OPEN_MIN_CM:
+            return "OPEN"
+        return "BORDERLINE"
+
+    @staticmethod
+    def _resolve_side(zone, previous_open, ir_wall=None):
+        """Fuse Sharp zone + stable digital IR.
+
+        Sharp remains authoritative in the two strong zones.  IR is most useful
+        in the 14-20 cm BORDERLINE band:
+
+          BLOCKED    -> False regardless of IR
+          BORDERLINE -> stable IR decides; otherwise hold previous state
+          OPEN       -> True regardless of IR; IR=WALL becomes a conflict flag
+          UNKNOWN    -> hold previous state
+        """
+        if zone == "BLOCKED":
+            if ir_wall is False:
+                return False, "SHARP_BLOCKED_IR_CONFLICT", "MEDIUM"
+            if ir_wall is True:
+                return False, "BLOCK_CONFIRMED", "HIGH"
+            return False, "SHARP_BLOCKED", "HIGH"
+
+        if zone == "OPEN":
+            if ir_wall is True:
+                # Strong Sharp opening is not overridden by one binary sensor.
+                return True, "SHARP_OPEN_IR_CONFLICT", "MEDIUM"
+            if ir_wall is False:
+                return True, "OPEN_CONFIRMED", "HIGH"
+            return True, "SHARP_OPEN", "HIGH"
+
+        if zone == "BORDERLINE":
+            if ir_wall is True:
+                return False, "IR_CONFIRMS_BLOCK", "HIGH"
+            if ir_wall is False:
+                return True, "IR_CONFIRMS_OPEN", "HIGH"
+            return previous_open, "BORDERLINE_HOLD", "LOW"
+
+        return previous_open, "UNKNOWN_HOLD", "LOW"
+
+    def classify_openings(
+        self,
+        front_cm,
+        left_cm,
+        right_cm,
+        left_ir_wall=None,
+        right_ir_wall=None,
+    ):
         front_open = (
             front_cm is not None
             and front_cm >= config.EXPLORATION_FRONT_OPEN_CM
@@ -81,16 +140,70 @@ class DecisionPointDetector:
             front_cm is not None
             and 0.0 < front_cm <= config.STOP_FRONT_CM
         )
-        left_open = (
-            left_cm is not None
-            and left_cm >= config.EXPLORATION_SIDE_OPEN_CM
-        )
-        right_open = (
-            right_cm is not None
-            and right_cm >= config.EXPLORATION_SIDE_OPEN_CM
+
+        self.last_left_zone = self.classify_side_zone(left_cm)
+        self.last_right_zone = self.classify_side_zone(right_cm)
+
+        # Allow quick disable from config for A/B testing.
+        if not config.ENABLE_IR_SIDE_FUSION:
+            left_ir_wall = None
+            right_ir_wall = None
+
+        (
+            self.left_open_memory,
+            self.last_left_fusion,
+            self.last_left_confidence,
+        ) = self._resolve_side(
+            self.last_left_zone,
+            self.left_open_memory,
+            left_ir_wall,
         )
 
-        return front_open, front_blocked, left_open, right_open
+        (
+            self.right_open_memory,
+            self.last_right_fusion,
+            self.last_right_confidence,
+        ) = self._resolve_side(
+            self.last_right_zone,
+            self.right_open_memory,
+            right_ir_wall,
+        )
+
+        return (
+            front_open,
+            front_blocked,
+            self.left_open_memory,
+            self.right_open_memory,
+        )
+
+    def get_side_zones(self):
+        return self.last_left_zone, self.last_right_zone
+
+    def get_side_fusion(self):
+        return {
+            "left": {
+                "zone": self.last_left_zone,
+                "resolved_open": self.left_open_memory,
+                "reason": self.last_left_fusion,
+                "confidence": self.last_left_confidence,
+            },
+            "right": {
+                "zone": self.last_right_zone,
+                "resolved_open": self.right_open_memory,
+                "reason": self.last_right_fusion,
+                "confidence": self.last_right_confidence,
+            },
+        }
+
+    def reset_side_memory(self):
+        self.left_open_memory = False
+        self.right_open_memory = False
+        self.last_left_zone = "UNKNOWN"
+        self.last_right_zone = "UNKNOWN"
+        self.last_left_fusion = "RESET"
+        self.last_right_fusion = "RESET"
+        self.last_left_confidence = "LOW"
+        self.last_right_confidence = "LOW"
 
     def _distance_from_latch(self, pose_x, pose_y):
         if (
@@ -100,25 +213,28 @@ class DecisionPointDetector:
             or self.latch_y is None
         ):
             return None
-
         return math.hypot(
             float(pose_x) - self.latch_x,
             float(pose_y) - self.latch_y,
         )
 
-    def _release_latch(self):
+    def _release_latch(self, reset_side_memory=False):
         self.latched = False
         self.candidate_count = 0
         self.clear_count = 0
         self.latch_x = None
         self.latch_y = None
         self.latch_time = None
+        if reset_side_memory:
+            self.reset_side_memory()
 
     def update(
         self,
         front_cm,
         left_cm,
         right_cm,
+        left_ir_wall=None,
+        right_ir_wall=None,
         pose_x=None,
         pose_y=None,
     ):
@@ -126,31 +242,23 @@ class DecisionPointDetector:
             front_cm,
             left_cm,
             right_cm,
+            left_ir_wall=left_ir_wall,
+            right_ir_wall=right_ir_wall,
         )
-
         now = time.monotonic()
 
         if self.latched:
-            # Consider the junction physically left once both side openings
-            # disappear. Front does NOT have to exceed the exploration-open
-            # threshold; it only must not already be an emergency front block.
+            # Once both side openings disappear and front is not an emergency
+            # block, the robot is physically leaving the old junction.
             normal_corridor = (
                 not left_open
                 and not right_open
                 and not front_blocked
             )
 
-            if normal_corridor:
-                self.clear_count += 1
-            else:
-                self.clear_count = 0
-
+            self.clear_count = self.clear_count + 1 if normal_corridor else 0
             distance = self._distance_from_latch(pose_x, pose_y)
-            elapsed = (
-                now - self.latch_time
-                if self.latch_time is not None
-                else None
-            )
+            elapsed = now - self.latch_time if self.latch_time is not None else None
 
             moved_minimum = (
                 distance is None
@@ -161,10 +269,6 @@ class DecisionPointDetector:
                 self.clear_count >= config.JUNCTION_REARM_SAMPLES
                 and moved_minimum
             )
-
-            # Distance/timeout alone must not unlock while the robot is still
-            # physically inside the same side opening. This was creating a
-            # second decision on J4 only ~10-18 cm after the first one.
             released_by_distance = (
                 distance is not None
                 and distance >= config.JUNCTION_REARM_DISTANCE_M
@@ -193,15 +297,10 @@ class DecisionPointDetector:
             ):
                 return False
 
-            self._release_latch()
+            self._release_latch(reset_side_memory=False)
 
-        # Decision point if front ends, or a side branch appears while moving.
         candidate = front_blocked or left_open or right_open
-
-        if candidate:
-            self.candidate_count += 1
-        else:
-            self.candidate_count = 0
+        self.candidate_count = self.candidate_count + 1 if candidate else 0
 
         if self.candidate_count >= config.JUNCTION_CONFIRM_SAMPLES:
             self.latched = True
@@ -214,18 +313,19 @@ class DecisionPointDetector:
 
         return False
 
-    def force_latched(self, pose_x=None, pose_y=None):
-        """Lock the just-used decision point until the robot has left it."""
+    def force_latched(self, pose_x=None, pose_y=None, reset_side_memory=True):
+        """Lock current decision point after turn; reset robot-relative side state."""
         self.latched = True
         self.candidate_count = 0
         self.clear_count = 0
         self.latch_x = float(pose_x) if pose_x is not None else None
         self.latch_y = float(pose_y) if pose_y is not None else None
         self.latch_time = time.monotonic()
+        if reset_side_memory:
+            self.reset_side_memory()
 
     def cancel_event(self):
-        """Release a false/invalid decision event after a stopped re-scan."""
-        self._release_latch()
+        self._release_latch(reset_side_memory=False)
 
 
 class TremauxExplorer:
@@ -248,6 +348,9 @@ class TremauxExplorer:
         # Pending edge = route currently being travelled.
         self.pending_from_node = None
         self.pending_abs_dir = None
+
+        # V10 diagnostic for expected-target node recognition.
+        self.last_node_match = None
 
         self.route_history = []
         self.dfs_stack = []
@@ -297,26 +400,131 @@ class TremauxExplorer:
 
         return node_id
 
-    def _find_nearby_node(self, x, y):
+    def _find_nearby_node(self, x, y, radius=None):
+        if radius is None:
+            radius = config.NODE_MATCH_RADIUS_M
+
         best_id = None
         best_distance = None
 
         for node_id, node in self.nodes.items():
             distance = math.hypot(x - node.x, y - node.y)
 
-            if distance <= config.NODE_MATCH_RADIUS_M:
+            if distance <= radius:
                 if best_distance is None or distance < best_distance:
                     best_id = node_id
                     best_distance = distance
 
-        return best_id
+        return best_id, best_distance
+
+    def _expected_pending_target(self):
+        """Return the known target of the edge currently being traversed.
+
+        Example: if we departed J9 through E and J9.E.target == J8, then J8
+        is the expected next decision node during backtracking.
+        """
+        if self.pending_from_node is None or self.pending_abs_dir is None:
+            return None
+
+        source = self.nodes.get(self.pending_from_node)
+        if source is None:
+            return None
+
+        exit_state = source.exits.get(self.pending_abs_dir % 4)
+        if exit_state is None:
+            return None
+
+        target_id = exit_state.target
+        if target_id not in self.nodes:
+            return None
+
+        return target_id
 
     def _get_or_create_node(self, x, y):
-        node_id = self._find_nearby_node(x, y)
-        is_new = node_id is None
+        """Recognise a decision node with expected-target priority.
 
-        if is_new:
+        Normal/new exploration still uses NODE_MATCH_RADIUS_M (0.18 m).
+        Only an edge that already has an explicit target may use wider matching.
+
+        Matching order:
+          1) expected target within 0.40 m -> trust it immediately,
+          2) otherwise probe the normal 0.18 m neighbourhood,
+          3) if nothing else is nearby, allow the expected target up to 0.65 m,
+          4) only then create a new node.
+
+        This fixes duplicate junctions on reverse approaches while still leaving
+        a sanity guard for a genuinely unexpected decision point.
+        """
+        self.last_node_match = None
+
+        expected_id = self._expected_pending_target()
+        expected_distance = None
+        if expected_id is not None:
+            expected = self.nodes[expected_id]
+            expected_distance = math.hypot(x - expected.x, y - expected.y)
+
+            if expected_distance <= config.EXPECTED_NODE_MATCH_RADIUS_M:
+                node_id = expected_id
+                is_new = False
+                self.last_node_match = {
+                    "mode": "EXPECTED",
+                    "node_id": node_id,
+                    "distance_m": expected_distance,
+                    "from_node": self.pending_from_node,
+                    "abs_dir": self.pending_abs_dir,
+                }
+            else:
+                node_id = None
+        else:
+            node_id = None
+
+        normal_id = None
+        normal_distance = None
+        if node_id is None:
+            normal_id, normal_distance = self._find_nearby_node(
+                x,
+                y,
+                radius=config.NODE_MATCH_RADIUS_M,
+            )
+
+            # Do not let a wider expected radius steal a clearly nearby node.
+            if normal_id is not None:
+                node_id = normal_id
+                is_new = False
+                self.last_node_match = {
+                    "mode": "NEARBY",
+                    "node_id": node_id,
+                    "distance_m": normal_distance,
+                    "expected_node": expected_id,
+                    "expected_distance_m": expected_distance,
+                }
+
+        if (
+            node_id is None
+            and expected_id is not None
+            and expected_distance is not None
+            and expected_distance <= config.EXPECTED_NODE_FALLBACK_RADIUS_M
+        ):
+            node_id = expected_id
+            is_new = False
+            self.last_node_match = {
+                "mode": "EXPECTED_RELAXED",
+                "node_id": node_id,
+                "distance_m": expected_distance,
+                "from_node": self.pending_from_node,
+                "abs_dir": self.pending_abs_dir,
+            }
+
+        if node_id is None:
             node_id = self._create_node(x, y)
+            is_new = True
+            self.last_node_match = {
+                "mode": "NEW",
+                "node_id": node_id,
+                "distance_m": None,
+                "expected_node": expected_id,
+                "expected_distance_m": expected_distance,
+            }
 
         node = self.nodes[node_id]
         node.seen_count += 1
@@ -347,6 +555,25 @@ class TremauxExplorer:
         source_exit = self._exit(from_node_id, abs_index)
         target_exit = self._exit(to_node_id, opposite)
 
+        # A known topological edge is immutable during ordinary traversal.
+        # Never silently overwrite J9->J8 with J9->J10 just because odometry
+        # caused the reverse approach to be detected at a shifted position.
+        if source_exit.target is not None and source_exit.target != to_node_id:
+            print(
+                f"GRAPH LINK CONFLICT: {from_node_id}."
+                f"{HEADINGS[abs_index]} already -> {source_exit.target}, "
+                f"refusing overwrite -> {to_node_id}"
+            )
+            return False
+
+        if target_exit.target is not None and target_exit.target != from_node_id:
+            print(
+                f"GRAPH LINK CONFLICT: {to_node_id}."
+                f"{HEADINGS[opposite]} already -> {target_exit.target}, "
+                f"refusing overwrite -> {from_node_id}"
+            )
+            return False
+
         source_exit.target = to_node_id
         target_exit.target = from_node_id
 
@@ -354,6 +581,7 @@ class TremauxExplorer:
         shared_visits = max(source_exit.visits, target_exit.visits)
         source_exit.visits = shared_visits
         target_exit.visits = shared_visits
+        return True
 
     def _increment_departure(self, node_id, abs_index):
         exit_state = self._exit(node_id, abs_index)
@@ -553,9 +781,6 @@ class TremauxExplorer:
             has_unvisited_branch = any(v == 0 for v in branch_visits)
             has_once_branch = any(v == 1 for v in branch_visits)
 
-            # IMPORTANT: an empty branch list means this first decision point
-            # may actually be a dead end/corner.  It is NOT proof that the maze
-            # has been explored.  In that case continue below and BACKTRACK.
             if (
                 branch_visits
                 and not has_unvisited_branch
