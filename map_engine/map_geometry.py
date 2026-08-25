@@ -89,15 +89,14 @@ def process_map_data(samples):
     straight_segs = []
     for seg in initial_segments:
         if seg["type"] == "straight" and len(seg["indices"]) >= 3:
-            yaws = [raw_s[idx]["yaw"] for idx in seg["indices"]]
-            sin_sum = sum(math.sin(math.radians(y)) for y in yaws)
-            cos_sum = sum(math.cos(math.radians(y)) for y in yaws)
-            avg_yaw = math.degrees(math.atan2(sin_sum, cos_sum))
-            
             p0 = raw_s[seg["indices"][0]]
             pe = raw_s[seg["indices"][-1]]
+            
+            # Use actual path direction for global alignment to avoid IMU offsets
+            path_yaw = math.degrees(math.atan2(pe["y"]-p0["y"], pe["x"]-p0["x"]))
+            
             length = math.hypot(pe["x"]-p0["x"], pe["y"]-p0["y"])
-            straight_segs.append({"avg_yaw": avg_yaw, "length": length})
+            straight_segs.append({"avg_yaw": path_yaw, "length": length})
             
     rot_angle_deg = 0.0
     if straight_segs:
@@ -143,16 +142,15 @@ def process_map_data(samples):
         if seg["type"] == "turn" or len(indices) < 3:
             continue
             
-        yaws = [rotated_samples[idx]["yaw"] for idx in indices]
-        sin_sum = sum(math.sin(math.radians(y)) for y in yaws)
-        cos_sum = sum(math.cos(math.radians(y)) for y in yaws)
-        avg_yaw = math.degrees(math.atan2(sin_sum, cos_sum))
-        
-        rad = math.radians(avg_yaw)
-        u_x, u_y = math.cos(rad), math.sin(rad)
-        
         p0_x = rotated_samples[indices[0]]["x"]
         p0_y = rotated_samples[indices[0]]["y"]
+        pe_x = rotated_samples[indices[-1]]["x"]
+        pe_y = rotated_samples[indices[-1]]["y"]
+        
+        # Use actual path geometry to define the corridor axis, making it immune to IMU yaw offsets
+        avg_yaw = math.degrees(math.atan2(pe_y - p0_y, pe_x - p0_x))
+        rad = math.radians(avg_yaw)
+        u_x, u_y = math.cos(rad), math.sin(rad)
         
         proj_pts = []
         for idx in indices:

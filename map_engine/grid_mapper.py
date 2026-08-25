@@ -60,17 +60,7 @@ class SLAMStyleMazeMapper:
         self.initialized = True
         
         os.makedirs(self.output_dir, exist_ok=True)
-        
-        csv_path = os.path.join(self.output_dir, "live_trajectory.csv")
-        self.live_csv = open(csv_path, "w", newline="", encoding="utf-8")
-        self.live_writer = csv.writer(self.live_csv)
-        self.live_writer.writerow([
-            "index", "time_sec", "map_x", "map_y", "theta_deg", 
-            "front_cm", "left_cm", "right_cm"
-        ])
-        self.live_csv.flush()
-        
-        print(f"Continuous Vector Mapper initialized. Live stream: {csv_path}")
+        print("Continuous Vector Mapper initialized. (Live stream disabled, saving at end)")
 
     def observe_junction(self, *args, **kwargs):
         pass
@@ -125,25 +115,27 @@ class SLAMStyleMazeMapper:
         }
         self.samples.append(sample)
 
-        # Stream to CSV for live_viewer.py
-        if self.live_csv and not self.live_csv.closed:
-            def fmt(v): return f"{v:.4f}" if v is not None else ""
-            self.live_writer.writerow([
-                sample["index"], f"{sample['time_sec']:.6f}",
-                fmt(sample["map_x"]), fmt(sample["map_y"]), fmt(sample["theta_deg"]),
-                fmt(sample["front_cm"]), fmt(sample["left_cm"]), fmt(sample["right_cm"])
-            ])
-            self.live_csv.flush()
-            
         return sample
 
     def save_all(self, rebuild=True, quiet=False):
         if not self.enabled or not self.initialized:
             return
             
-        if self.live_csv and not self.live_csv.closed:
-            self.live_csv.close()
-            
+        csv_path = os.path.join(self.output_dir, "trajectory.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "index", "time_sec", "map_x", "map_y", "theta_deg", 
+                "front_cm", "left_cm", "right_cm"
+            ])
+            def fmt(v): return f"{v:.4f}" if v is not None else ""
+            for s in self.samples:
+                w.writerow([
+                    s["index"], f"{s['time_sec']:.6f}",
+                    fmt(s["map_x"]), fmt(s["map_y"]), fmt(s["theta_deg"]),
+                    fmt(s["front_cm"]), fmt(s["left_cm"]), fmt(s["right_cm"])
+                ])
+                
         self._generate_vector_image(quiet)
         
     def _split_into_polylines(self, points, max_gap=0.20):
