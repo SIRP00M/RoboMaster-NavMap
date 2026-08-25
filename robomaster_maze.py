@@ -59,6 +59,8 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 
+from map_engine.grid_mapper import SLAMStyleMazeMapper
+
 # ============================================================
 # CONFIG - mostly preserved from the supplied working values
 # ============================================================
@@ -1883,6 +1885,7 @@ def main():
         junctions = JunctionDetector()
         exit_detector = ExitDetector()
         explorer = MazeGraphExplorer()
+        mapper = SLAMStyleMazeMapper()
 
         tof_subscribed = tof_sensor.sub_distance(freq=20, callback=sensors.tof_callback)
         pose_subscribed = chassis.sub_position(cs=1, freq=POSE_FREQ_HZ, callback=pose.position_callback)
@@ -1891,6 +1894,7 @@ def main():
         start_x, start_y = wait_for_position(pose)
         start_yaw = wait_for_yaw(pose)
         heading.initialize(start_yaw)
+        mapper.initialize(start_x, start_y, start_yaw, heading_index=0)
 
         start_node = explorer.initialize_start(start_x, start_y)
 
@@ -2144,6 +2148,20 @@ def main():
                     mode,
                 )
 
+            px, py = pose.get_xy()
+            yaw = pose.get_yaw()
+            if None not in (px, py) and yaw is not None:
+                mapper.update(
+                    raw_x=px,
+                    raw_y=py,
+                    yaw_deg=yaw,
+                    front_cm=front_cm,
+                    left_cm=left_cm,
+                    right_cm=right_cm,
+                    heading_index=explorer.heading_index,
+                    mode=mode
+                )
+
             if ENABLE_MOTION:
                 chassis.drive_speed(
                     x=x_cmd,
@@ -2183,6 +2201,12 @@ def main():
         raise
 
     finally:
+        try:
+            print("Saving map...")
+            mapper.save_all()
+        except Exception as e:
+            print("Failed to save map:", e)
+
         try:
             stop_chassis(chassis)
         except Exception:
