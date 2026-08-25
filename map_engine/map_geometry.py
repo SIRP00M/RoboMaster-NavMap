@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import cv2
 
 def normalize_angle_deg(a):
     return (a % 360.0 + 360.0) % 360.0
@@ -172,8 +173,8 @@ def process_map_data(samples):
             if ld: lefts.append(ld)
             if rd: rights.append(rd)
             
-        avg_l = sorted(lefts)[len(lefts)//2] if lefts else 0.15
-        avg_r = sorted(rights)[len(rights)//2] if rights else 0.15
+        avg_l = sorted(lefts)[len(lefts)//2] if lefts else 0.22
+        avg_r = sorted(rights)[len(rights)//2] if rights else 0.22
         
         U_px, U_py = to_plot_coords(u_x, u_y)
         N_px, N_py = -U_py, U_px
@@ -242,16 +243,13 @@ def process_map_data(samples):
                     g2["C_start"] = C_int
             break
 
-    # 4. Generate Drawing Primitives
+    # 4. Generate Drawing Primitives (Polygons and Trajectory)
     polygons = []
-    raw_wall_lines = []
     trajectory_pts = []
     
     for idx, g in enumerate(segment_geoms):
         poly = [g["L_start"], g["L_end"], g["R_end"], g["R_start"]]
         polygons.append(poly)
-        if g["has_left"]: raw_wall_lines.append([g["L_start"], g["L_end"]])
-        if g["has_right"]: raw_wall_lines.append([g["R_start"], g["R_end"]])
         
         trajectory_pts.append(g["C_start"])
         trajectory_pts.append(g["C_end"])
@@ -271,32 +269,75 @@ def process_map_data(samples):
                 polygons.append(corner_poly)
                 break
         
-    # 5. Parallel Wall Dedup
+    # 5. Extract Continuous Wall Lines using OpenCV Contour
     wall_lines = []
-    def is_duplicate(line1, line2, threshold=0.35):
-        d1 = point_to_segment_dist(line2[0], line1[0], line1[1])
-        d2 = point_to_segment_dist(line2[1], line1[0], line1[1])
-        if max(d1, d2) < threshold:
-            dx = line1[1][0] - line1[0][0]
-            dy = line1[1][1] - line1[0][1]
-            l2 = dx*dx + dy*dy
-            if l2 == 0: return False
-            t1 = ((line2[0][0]-line1[0][0])*dx + (line2[0][1]-line1[0][1])*dy) / l2
-            t2 = ((line2[1][0]-line1[0][0])*dx + (line2[1][1]-line1[0][1])*dy) / l2
-            t_min, t_max = min(t1, t2), max(t1, t2)
-            if t_max > -0.1 and t_min < 1.1:
-                return True
-        return False
-
-    raw_wall_lines.sort(key=lambda l: math.hypot(l[1][0]-l[0][0], l[1][1]-l[0][1]), reverse=True)
-    
-    for current_line in raw_wall_lines:
-        dup = False
-        for accepted in wall_lines:
-            if is_duplicate(accepted, current_line, threshold=0.35):
-                dup = True
-                break
-        if not dup:
-            wall_lines.append(current_line)
+    if polygons:
+        # Determine bounds
+        all_pts = [p for poly in polygons for p in poly]
+        min_x, max_x = min(p[0] for p in all_pts), max(p[0] for p in all_pts)
+        min_y, max_y = min(p[1] for p in all_pts), max(p[1] for p in all_pts)
+        
+        # Add padding (1 meter)
+        pad = 1.0
+        min_x -= pad; max_x += pad
+        min_y -= pad; max_y += pad
+        
+        # Resolution: 100 pixels per meter (1cm per pixel)
+        resolution = 100
+        width = int((max_x - min_x) * resolution)
+        height = int((max_y - min_y) * resolution)
+        
+        if width > 0 and height > 0:
+            img = np.zeros((height, width), dtype=np.uint8)
+            
+            # Convert polygons to pixel coordinates
+            pixel_polys = []
+            for poly in polygons:
+                px_poly = []
+                for x, y in poly:
+                    px = int((x - min_x) * resolution)
+                    py = int((y - min_y) * resolution)
+                    px_poly.append([px, py])
+                # Use convex hull to prevent self-intersecting bowties at corners
+                px_arr = np.array(px_poly, dtype=np.int32)
+                hull = cv2.convexHull(px_arr)
+                pixel_polys.append(hull)
+                
+            # Draw solid white polygons
+            cv2.fillPoly(img, pixel_polys, 255)
+            
+            # Apply Morphological Close to fuse sliver gaps between disjoint segment polygons
+            kernel = np.ones((25, 25), np.uint8)
+            img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
+            
+            # Extract contours
+            contours, _ = cv2.findContours(img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Convert contours back to line segments in map coordinates
+            for cnt in contours:
+                # Filter out tiny micro-cavities (area < 500 square pixels, i.e., 0.05 m^2)
+                if cv2.contourArea(cnt) < 500:
+                    continue
+                    
+                # Simplify contour to remove pixel staircase effect
+                epsilon = 2.0
+                approx = cv2.approxPolyDP(cnt, epsilon, True)
+                
+                if len(approx) < 2:
+                    continue
+                approx = approx.squeeze(axis=1) # shape (N, 2)
+                if len(approx.shape) == 1:
+                    continue
+                    
+                for i in range(len(approx)):
+                    p1 = approx[i]
+                    p2 = approx[(i+1) % len(approx)]
+                    
+                    x1 = p1[0] / resolution + min_x
+                    y1 = p1[1] / resolution + min_y
+                    x2 = p2[0] / resolution + min_x
+                    y2 = p2[1] / resolution + min_y
+                    
+                    wall_lines.append([(x1, y1), (x2, y2)])
             
     return polygons, wall_lines, trajectory_pts
