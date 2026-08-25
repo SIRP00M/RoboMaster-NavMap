@@ -117,7 +117,7 @@ SIDE_WARNING_FORWARD_SPEED = 0.08
 SIDE_WARNING_Y_SPEED = 0.05
 
 # Front-corner IR has priority over normal wall following.
-IR_ESCAPE_Y_SPEED = 0.08
+IR_ESCAPE_Y_SPEED = 0.15
 IR_ESCAPE_FORWARD_SPEED = 0.00
 
 Y_DIR_SIGN = 1
@@ -1551,7 +1551,7 @@ def travelled_from(start_xy, pose: PoseTracker) -> Optional[float]:
     return distance_xy(start_xy, pose.get_xy())
 
 
-def feedback_turn(chassis, pose: PoseTracker, relative: str) -> bool:
+def feedback_turn(chassis, sensors: SensorManager, pose: PoseTracker, relative: str) -> bool:
     angle = RELATIVE_TURN_DEG[relative]
     if abs(angle) < 0.001:
         return True
@@ -1564,7 +1564,6 @@ def feedback_turn(chassis, pose: PoseTracker, relative: str) -> bool:
         return False
 
     # Preserve supplied robot convention:
-    # RIGHT logical command=-90 and move->yaw sign=-1 => attitude target +90.
     target_yaw = normalize_angle_deg(start_yaw + angle * DEFAULT_MOVE_TO_YAW_SIGN)
     timeout = TURN_FEEDBACK_TIMEOUT_180_SEC if abs(angle) > 135 else TURN_FEEDBACK_TIMEOUT_90_SEC
 
@@ -1580,6 +1579,26 @@ def feedback_turn(chassis, pose: PoseTracker, relative: str) -> bool:
         if yaw is None:
             time.sleep(TURN_FEEDBACK_LOOP_SEC)
             continue
+
+        # --- ส่วนที่เพิ่มใหม่: ระบบ IR หยุดรถและสไลด์หนีขณะเลี้ยว ---
+        ir_left, ir_right = sensors.read_front_corner_ir()
+        if ir_left is True or ir_right is True:
+            y_cmd = 0.0
+            if ir_left:
+                y_cmd = +IR_ESCAPE_Y_SPEED * Y_DIR_SIGN
+                print(">>> TURN PAUSED: Left IR blocked! หยุดหมุนแล้วสไลด์หนีขวา...")
+            elif ir_right:
+                y_cmd = -IR_ESCAPE_Y_SPEED * Y_DIR_SIGN
+                print(">>> TURN PAUSED: Right IR blocked! หยุดหมุนแล้วสไลด์หนีซ้าย...")
+
+            # สั่งสไลด์ (y) โดยหยุดการเดินหน้า (x) และการหมุน (z) ทั้งหมด
+            chassis.drive_speed(x=0.0, y=y_cmd, z=0.0, timeout=TURN_FEEDBACK_DRIVE_TIMEOUT_SEC)
+            time.sleep(TURN_FEEDBACK_LOOP_SEC)
+            
+            # ชดเชยเวลา timeout ออกไป เพื่อไม่ให้การเลี้ยวล้มเหลวเพราะเสียเวลาหลบกำแพง
+            started = time.monotonic()
+            continue # ย้อนกลับไปเช็คใหม่จนกว่า IR จะว่าง ถึงจะยอมให้โค้ดลงไปหมุนต่อ
+        # --------------------------------------------------
 
         err = shortest_angle_error_deg(target_yaw, yaw)
         if abs(err) <= TURN_FEEDBACK_TOLERANCE_DEG:
@@ -2060,7 +2079,7 @@ def main():
                 )
 
                 # Physical action first; graph edge is marked only if turn succeeds.
-                if not feedback_turn(chassis, pose, plan.relative):
+                if not feedback_turn(chassis, sensors, pose, plan.relative):
                     stop_chassis(chassis)
                     print("Turn failed safely; departure NOT committed")
                     break
