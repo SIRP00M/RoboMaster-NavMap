@@ -1,13 +1,28 @@
-"""Trémaux / DFS-style maze exploration with topological memory."""
+"""Trémaux / DFS frontier-aware topological exploration and graph memory."""
 
-from collections import deque
+import config
+
+# ==================== FRONTIER EXPLORATION ====================
+"""Trémaux / DFS-style maze exploration with topological memory.
+
+The explorer remembers decision points (junctions/corners/dead ends) using
+RoboMaster chassis odometry.  Every exit has a visit count:
+
+    0 = never used        -> highest priority
+    1 = used once         -> backtracking / second choice
+    2+ = already covered  -> avoid unless there is no alternative
+
+This is deliberately topological rather than a full occupancy-grid mapper.
+"""
+
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Optional
 import json
 import math
 import time
 
-import config
+
 
 HEADINGS = ("N", "E", "S", "W")
 RELATIVE_ORDER = ("FRONT", "RIGHT", "BACK", "LEFT")
@@ -600,6 +615,12 @@ class TremauxExplorer:
         self.root_decision_node_id = None
         self.root_entry_abs_dir = None
 
+        # V7: the robot initially points INTO the maze. The opposite absolute
+        # direction at J0 is the physical entrance/outside and must never become
+        # a frontier or a valid exploration/exit direction.
+        self.start_inside_abs_dir = None
+        self.start_outside_abs_dir = None
+
         # Pending edge = corridor currently being travelled.
         self.pending_from_node = None
         self.pending_abs_dir = None
@@ -966,6 +987,8 @@ class TremauxExplorer:
             raise RuntimeError("initialize_start() must be called first")
 
         abs_index = self.heading_index
+        self.start_inside_abs_dir = abs_index % 4
+        self.start_outside_abs_dir = self.opposite_index(abs_index)
         self._increment_departure(self.current_node_id, abs_index)
         self.pending_from_node = self.current_node_id
         self.pending_abs_dir = abs_index
@@ -1098,6 +1121,51 @@ class TremauxExplorer:
             and not state.blocked
         )
 
+    @staticmethod
+    def _is_unresolved_state(state):
+        """Traversed/open edge whose destination was never linked.
+
+        This is different from a normal frontier: visits is already >0, but
+        target is still None. Treating it as fully explored can hide a real
+        branch and make graph routing loop around other nodes.
+        """
+        if not bool(getattr(config, "ENABLE_UNRESOLVED_EDGE_RECOVERY", True)):
+            return False
+        max_visits = max(1, int(getattr(config, "UNRESOLVED_EDGE_MAX_VISITS", 3)))
+        return (
+            0 < state.visits <= max_visits
+            and state.target is None
+            and not state.blocked
+        )
+
+    def unresolved_exits(self, node_id=None):
+        if node_id is None:
+            node_id = self.current_node_id
+        if node_id is None or node_id not in self.nodes:
+            return []
+        result = []
+        for abs_index, state in self.nodes[node_id].exits.items():
+            if self._is_unresolved_state(state):
+                result.append(abs_index % 4)
+        return sorted(result)
+
+    def pending_exits(self, node_id=None):
+        """All exits that still require exploration or graph resolution."""
+        if node_id is None:
+            node_id = self.current_node_id
+        if node_id is None or node_id not in self.nodes:
+            return []
+        result = set(self.frontier_exits(node_id))
+        result.update(self.unresolved_exits(node_id))
+        return sorted(result)
+
+    def all_pending_exits(self):
+        result = []
+        for node_id in sorted(self.nodes, key=lambda n: int(n[1:]) if n[1:].isdigit() else n):
+            for abs_index in self.pending_exits(node_id):
+                result.append((node_id, abs_index))
+        return result
+
     def frontier_exits(self, node_id=None):
         if node_id is None:
             node_id = self.current_node_id
@@ -1176,7 +1244,7 @@ class TremauxExplorer:
         if not self.dfs_stack:
             return None
         for node_id in reversed(self.dfs_stack[:-1]):
-            if self.frontier_exits(node_id):
+            if self.pending_exits(node_id):
                 return node_id
         return None
 
@@ -1193,7 +1261,7 @@ class TremauxExplorer:
         while q:
             path = q.popleft()
             node_id = path[-1]
-            if node_id != start and self.frontier_exits(node_id):
+            if node_id != start and self.pending_exits(node_id):
                 return path
 
             for nxt, abs_index in self._graph_neighbors(node_id):
@@ -1205,8 +1273,68 @@ class TremauxExplorer:
                 q.append(path + [nxt])
         return None
 
+    def _least_cost_pending_path(self, allowed_first_abs):
+        """Dijkstra route to pending work with a penalty for reused edges.
+
+        This is intentionally used only after local FRONTIER / UNRESOLVED exits
+        have already been handled. In cyclic mazes it is more stable than
+        replaying the historical DFS stack because an edge crossed 4-5 times
+        becomes much more expensive than a fresh known transit edge.
+        """
+        if not bool(getattr(config, "ENABLE_WEIGHTED_PENDING_ROUTING", True)):
+            return None
+        start = self.current_node_id
+        if start is None or start not in self.nodes:
+            return None
+
+        import heapq
+        allowed_first_abs = set(allowed_first_abs)
+        base = float(getattr(config, "ROUTE_EDGE_BASE_COST", 1.0))
+        visit_pen = float(getattr(config, "ROUTE_EDGE_VISIT_PENALTY", 1.75))
+        high_extra = float(getattr(config, "ROUTE_EDGE_HIGH_VISIT_EXTRA", 2.0))
+        unresolved_extra = float(getattr(config, "ROUTE_PENDING_UNRESOLVED_EXTRA", 1.25))
+
+        # (cost, hops, node, path)
+        pq = [(0.0, 0, start, [start])]
+        best = {start: 0.0}
+
+        while pq:
+            cost, hops, node_id, path = heapq.heappop(pq)
+            if cost > best.get(node_id, float("inf")) + 1e-9:
+                continue
+
+            if node_id != start and self.pending_exits(node_id):
+                # Prefer true frontiers over merely-unresolved work when route
+                # costs are otherwise similar.
+                pending = self.pending_exits(node_id)
+                if pending and all(
+                    p not in self.frontier_exits(node_id)
+                    for p in pending
+                ):
+                    cost += unresolved_extra
+                return path, cost
+
+            for nxt, abs_index in self._graph_neighbors(node_id):
+                if len(path) == 1 and abs_index not in allowed_first_abs:
+                    continue
+                state = self._exit(node_id, abs_index)
+                visits = max(0, int(state.visits))
+                edge_cost = base + visit_pen * visits
+                if visits >= 3:
+                    edge_cost += high_extra * (visits - 2)
+                new_cost = cost + edge_cost
+                if new_cost + 1e-9 >= best.get(nxt, float("inf")):
+                    continue
+                best[nxt] = new_cost
+                heapq.heappush(pq, (new_cost, hops + 1, nxt, path + [nxt]))
+
+        return None
+
     def _frontier_signature(self):
-        return tuple(self.all_frontiers())
+        # Keep the old method name for compatibility, but include unresolved
+        # edges too. Loop protection should reset whenever either a true
+        # frontier or an unresolved graph edge changes.
+        return tuple(self.all_pending_exits())
 
     def _route_attempt_key(self, abs_index, frontier_signature=None):
         if frontier_signature is None:
@@ -1241,6 +1369,26 @@ class TremauxExplorer:
             right_open,
             allow_back=allow_back,
         )
+
+        # V7 START-GATE virtual wall. When J0 is revisited from inside, the
+        # physical entrance often appears as a perfectly valid FRONT opening.
+        # Never register that outside direction as a frontier and never choose it.
+        if (
+            bool(getattr(config, "ENABLE_START_GATE_GUARD", True))
+            and self.current_node_id == self.start_node_id
+            and self.start_outside_abs_dir is not None
+        ):
+            before = list(candidates)
+            candidates = [
+                item for item in candidates
+                if (item[1] % 4) != (self.start_outside_abs_dir % 4)
+            ]
+            if len(candidates) != len(before):
+                print(
+                    ">>> START_GATE PLANNER BLOCK "
+                    f"outside={self.heading_name(self.start_outside_abs_dir)}"
+                )
+
         self._update_frontier_observations(candidates)
 
         preference_rank = {
@@ -1271,6 +1419,31 @@ class TremauxExplorer:
                 direction=relative,
                 node_id=self.current_node_id,
                 reason="UNVISITED_EXIT",
+                visits_before=visits,
+                absolute_heading=self.heading_name(abs_index),
+            )
+
+        # V8: a physically confirmed opening may already have visits>0 while
+        # target is still None. That means we departed this way before but never
+        # linked the corridor to its destination node. Do not route away from
+        # such an opening as if it were explored; resolve it first.
+        local_unresolved = [
+            item for item in scored
+            if self._is_unresolved_state(item[4])
+        ]
+        if local_unresolved:
+            visits, _, relative, abs_index, _ = local_unresolved[0]
+            self.completed = False
+            self._record_graph_event(
+                "UNRESOLVED_EDGE_LOCAL_RETRY",
+                node=self.current_node_id,
+                heading=self.heading_name(abs_index),
+                visits=visits,
+            )
+            return ExplorationDecision(
+                direction=relative,
+                node_id=self.current_node_id,
+                reason="UNRESOLVED_EDGE_RETRY",
                 visits_before=visits,
                 absolute_heading=self.heading_name(abs_index),
             )
@@ -1322,9 +1495,12 @@ class TremauxExplorer:
                 )
 
         global_frontiers = self.all_frontiers()
+        global_pending = self.all_pending_exits()
 
-        # 2) No active frontier anywhere -> true global completion.
-        if not global_frontiers:
+        # 2) No true frontier AND no recoverable unresolved edge anywhere ->
+        # true global completion. This prevents a visits>0,target=None corridor
+        # from disappearing from the exploration workload.
+        if not global_pending:
             self.completed = True
             return ExplorationDecision(
                 direction="COMPLETE",
@@ -1334,7 +1510,7 @@ class TremauxExplorer:
                 absolute_heading=self.heading_name(),
             )
 
-        frontier_signature = tuple(global_frontiers)
+        frontier_signature = tuple(global_pending)
         physically_allowed_abs = {abs_index for _, abs_index in candidates}
         repeated_abs = self._repeated_route_abs(candidates, frontier_signature)
         allowed_first_abs = set(physically_allowed_abs) - repeated_abs
@@ -1363,8 +1539,42 @@ class TremauxExplorer:
         if not allowed_first_abs:
             allowed_first_abs = set(physically_allowed_abs)
 
-        # 3) Prefer classic DFS backtracking along the current stack toward the
-        # nearest ancestor that still owns a frontier.
+        # 3) V10: in a graph containing loops/islands, route to pending work by
+        # least weighted traversal cost before replaying the historical DFS
+        # stack. This sharply reduces repeated laps through heavily used edges.
+        weighted = self._least_cost_pending_path(allowed_first_abs)
+        if weighted is not None:
+            path, route_cost = weighted
+            if path and len(path) >= 2:
+                abs_index = self._abs_to_target(
+                    self.current_node_id,
+                    path[1],
+                    allowed_abs=allowed_first_abs,
+                )
+                if abs_index is not None:
+                    relative = self.relative_for_absolute(abs_index)
+                    visits = self._exit(self.current_node_id, abs_index).visits
+                    self.completed = False
+                    self._record_graph_event(
+                        "WEIGHTED_PENDING_ROUTE",
+                        node=self.current_node_id,
+                        next_node=path[1],
+                        target_node=path[-1],
+                        heading=self.heading_name(abs_index),
+                        visits=visits,
+                        route_cost=route_cost,
+                        path=path,
+                    )
+                    return ExplorationDecision(
+                        direction=relative,
+                        node_id=self.current_node_id,
+                        reason="ROUTE_TO_LOW_COST_PENDING",
+                        visits_before=visits,
+                        absolute_heading=self.heading_name(abs_index),
+                    )
+
+        # 4) Fallback: classic DFS-stack routing when the weighted graph path
+        # cannot be formed because topology is temporarily incomplete.
         stack_target = self._preferred_stack_frontier_target()
         if stack_target is not None:
             if len(self.dfs_stack) >= 2:
@@ -1409,7 +1619,7 @@ class TremauxExplorer:
                         absolute_heading=self.heading_name(abs_index),
                     )
 
-        # 4) Loops / merged topology can leave a frontier outside the active DFS
+        # 5) Loops / merged topology can leave a frontier outside the active DFS
         # stack. Route to the nearest reachable frontier node in the graph.
         path = self._nearest_reachable_frontier_path(allowed_first_abs)
         if path and len(path) >= 2:
@@ -1430,7 +1640,7 @@ class TremauxExplorer:
                     absolute_heading=self.heading_name(abs_index),
                 )
 
-        # 5) Frontiers exist but current graph/sensor snapshot cannot route to
+        # 6) Frontiers exist but current graph/sensor snapshot cannot route to
         # one. Do not falsely COMPLETE. Use any physically available known edge
         # as a recovery transit; BACK naturally wins preference when it is the
         # only route from a dead end.
@@ -1536,6 +1746,8 @@ class TremauxExplorer:
             suffix = ""
             if self._is_frontier_state(exit_state):
                 suffix = "[FRONTIER]"
+            elif self._is_unresolved_state(exit_state):
+                suffix = "[UNRESOLVED]"
             elif exit_state.blocked:
                 suffix = "[STALE]"
             parts.append(
@@ -1562,6 +1774,11 @@ class TremauxExplorer:
                 {"node": node_id, "heading": self.heading_name(abs_index)}
                 for node_id, abs_index in self.all_frontiers()
             ],
+            "unresolved_edges": [
+                {"node": node_id, "heading": self.heading_name(abs_index)}
+                for node_id, abs_index in self.all_pending_exits()
+                if abs_index in self.unresolved_exits(node_id)
+            ],
             "dfs_stack": list(self.dfs_stack),
             "nodes": {},
             "route_history": self.route_history,
@@ -1581,6 +1798,7 @@ class TremauxExplorer:
                         "miss_count": exit_state.miss_count,
                         "blocked": exit_state.blocked,
                         "frontier": self._is_frontier_state(exit_state),
+                        "unresolved": self._is_unresolved_state(exit_state),
                     }
                     for abs_index, exit_state in node.exits.items()
                 },

@@ -1,3 +1,10 @@
+"""Central configuration for RoboMaster Maze Explorer V10.1.
+
+All tunable constants live here. Other modules import this module as `config`,
+so changing a value here is immediately used everywhere on the next run.
+"""
+
+# ==================== CONFIG ====================
 """Configuration for the RoboMaster maze solver.
 
 ปรับค่าจูนของหุ่นทั้งหมดจากไฟล์นี้ไฟล์เดียว
@@ -8,7 +15,7 @@
 # ============================================================
 
 ENABLE_MOTION = True
-PROGRAM_VERSION = "WALK_ONLY_V6_INTERSECTION_WINDOW"
+PROGRAM_VERSION = "V10.1_SENSOR_TIMEOUT_GUARD_HEADING_ENTRY_REALIGN"
 
 
 # ============================================================
@@ -27,6 +34,14 @@ SHARP_EMA_OLD_WEIGHT = 0.4
 
 # ถ้า ToF ไม่อัปเดตเกินเวลานี้ ให้ถือว่าไม่รู้ระยะหน้า
 TOF_STALE_SEC = 0.40
+
+# V10.1: synchronous Sensor Adapter ADC reads can occasionally time out and
+# return None. Never feed None into the median filter. A single timeout may
+# reuse the most recent valid Sharp value briefly; a prolonged outage makes
+# the main loop stop and wait for the sensors to recover.
+SHARP_STALE_HOLD_SEC = 1.50
+SHARP_INVALID_WARN_INTERVAL_SEC = 1.00
+SHARP_SENSOR_RECOVERY_DELAY_SEC = 0.08
 
 
 # ============================================================
@@ -153,6 +168,21 @@ HEADING_ALIGN_TOLERANCE_DEG = 2.0
 HEADING_ALIGN_TIMEOUT_SEC = 1.20
 HEADING_ALIGN_LOOP_SEC = 0.04
 
+# V10: corridor-referenced self calibration.  The IMU yaw can drift slowly
+# during a long run.  In a straight, wall-bounded corridor the change in
+# Sharp wall distance gives an external estimate of chassis skew.  Apply only
+# a small fraction to the absolute yaw grid so noise/junction edges cannot
+# jerk the heading reference.
+ENABLE_CORRIDOR_HEADING_CALIBRATION = True
+CORRIDOR_CAL_MIN_TRAVEL_M = 0.18
+CORRIDOR_CAL_MIN_WALL_CM = 5.8
+CORRIDOR_CAL_MAX_WALL_CM = 16.0
+CORRIDOR_CAL_MAX_ESTIMATE_DEG = 7.0
+CORRIDOR_CAL_ALPHA = 0.12
+CORRIDOR_CAL_MAX_STEP_DEG = 0.65
+CORRIDOR_CAL_MIN_FRONT_CM = 40.0
+CORRIDOR_CAL_LOG_MIN_STEP_DEG = 0.12
+
 
 # ============================================================
 # JUNCTION CENTERING / LEAVING
@@ -236,9 +266,26 @@ OPENING_ZONE_MIN_LENGTH_M = 0.10
 OPENING_ZONE_MAX_LENGTH_M = 0.70
 ENABLE_OPENING_ZONE_CENTERING = True
 OPENING_ZONE_CENTERING_SPEED = 0.07
-OPENING_ZONE_CENTERING_MAX_BACKTRACK_M = 0.40
-OPENING_ZONE_CENTERING_MAX_SEC = 6.5
+OPENING_ZONE_CENTERING_MAX_BACKTRACK_M = 0.48
+OPENING_ZONE_CENTERING_MAX_SEC = 7.0
 OPENING_ZONE_CENTERING_LOOP_SEC = 0.04
+# The detector starts only after several OPEN samples, so its measured near
+# edge is a little late.  Bias the return slightly farther backward.
+OPENING_ZONE_CENTER_REVERSE_BIAS_M = 0.035
+
+# V10: before a LEFT/RIGHT rotation, the chosen side must be physically open
+# at the robot's current pivot.  If accumulated Intersection Window memory says
+# a branch exists but the stopped Sharp scan no longer sees it, search backward
+# a short distance before turning.  This prevents rotating after overshooting
+# the mouth and sweeping the chassis into the wall.
+ENABLE_TURN_ENTRY_REALIGN = True
+TURN_ENTRY_OPEN_CM = 17.5
+TURN_ENTRY_CONFIRM_SAMPLES = 2
+TURN_ENTRY_SEARCH_SPEED = 0.045
+TURN_ENTRY_MAX_BACKTRACK_M = 0.13
+TURN_ENTRY_MAX_SEC = 3.0
+TURN_ENTRY_FRONT_SAFE_CM = 11.5
+TURN_ENTRY_LOOP_SEC = 0.04
 
 # V6: after the first confirmed side opening, keep observing a short
 # intersection window instead of deciding from one stopped snapshot.
@@ -250,6 +297,65 @@ INTERSECTION_WINDOW_MAX_M = 0.55
 INTERSECTION_MIN_OPEN_SAMPLES = 2
 INTERSECTION_FRONT_OPEN_CM = 35.0
 INTERSECTION_SIDE_OPEN_CM = SIDE_OPEN_ENTER_CM
+
+
+# ============================================================
+# OPEN AREA + EXIT DETECTION
+# ============================================================
+
+# Large open spaces need different lateral behaviour from a corridor.
+# When BOTH Sharp sensors stay far from walls and the front is traversable,
+# latch OPEN_AREA and let attitude heading-hold keep the robot straight.
+ENABLE_OPEN_AREA_HEADING_HOLD = True
+OPEN_AREA_SIDE_ENTER_CM = 35.0
+OPEN_AREA_SIDE_EXIT_CM = 28.0
+OPEN_AREA_FRONT_MIN_CM = 45.0
+OPEN_AREA_ENTER_SAMPLES = 4
+OPEN_AREA_EXIT_SAMPLES = 3
+
+# Exit detection is intentionally conservative. A single wide junction must
+# never become EXIT. The robot first enters open area, then all three measured
+# directions must be very open for several samples, and the robot must travel
+# forward through that open region before EXIT is confirmed.
+ENABLE_EXIT_DETECTION = True
+STOP_WHEN_EXIT_FOUND = True
+EXIT_FRONT_START_CM = 165.0
+EXIT_FRONT_KEEP_CM = 130.0
+EXIT_SIDE_START_CM = 55.0
+EXIT_SIDE_KEEP_CM = 42.0
+EXIT_START_SAMPLES = 4
+EXIT_CONFIRM_STRONG_SAMPLES = 8
+EXIT_CONFIRM_DISTANCE_M = 0.60
+EXIT_CONFIRM_MIN_SEC = 1.80
+EXIT_MIN_RUNTIME_SEC = 5.0
+EXIT_MIN_NODE_COUNT = 2
+EXIT_MAX_HEADING_ERROR_DEG = 8.0
+# Slow down while proving an exit so there is room to stop outside the maze.
+EXIT_CANDIDATE_SPEED = 0.12
+
+
+# ============================================================
+# START-GATE GUARD (V7)
+# ============================================================
+# The entrance is physically open just like a true exit. V7 treats the direction
+# behind the initial pose as a virtual wall. This protection exists at THREE
+# levels: planner filtering, exit-candidate rejection, and a geometric emergency
+# recovery if the robot gets close to crossing the start line while facing out.
+ENABLE_START_GATE_GUARD = True
+
+# Learn the physical inward vector from the robot's first straight displacement.
+# This avoids assuming how RoboMaster raw x/y axes are oriented.
+START_GATE_LEARN_DISTANCE_M = 0.12
+
+# Geometric safety gate around the starting opening.
+START_GATE_HALF_WIDTH_M = 0.45
+START_GATE_BLOCK_INNER_M = 0.20
+START_GATE_RECOVERY_COOLDOWN_SEC = 1.0
+
+# An EXIT candidate is forbidden near the start even if ToF/Sharp all look open.
+START_EXIT_REJECT_RADIUS_M = 0.90
+START_EXIT_REJECT_INNER_PROGRESS_M = 0.45
+START_EXIT_REJECT_LATERAL_M = 0.65
 
 
 # ระยะหน้า 17-24 cm ยังใกล้กำแพงเกินไปที่จะถือว่าเป็นทางตรง
@@ -300,10 +406,33 @@ FRONTIER_STALE_MISS_LIMIT = 3
 ENABLE_INTERMEDIATE_NODE_EDGE_SPLIT = True
 
 # Prevent ROUTE_TO_* from choosing the exact same directed edge again while the
-# set of remaining frontiers has not changed. This breaks J3<->...<->J9 style
-# oscillation without globally preferring FRONT over correct DFS backtracking.
+# set of remaining exploration obligations has not changed. This breaks
+# J3<->...<->J9 style oscillation without globally preferring FRONT over correct
+# DFS backtracking.
 ENABLE_ROUTE_LOOP_BREAK = True
 ROUTE_REPEAT_LIMIT = 1
+
+# V8 unresolved-edge recovery.
+# A physically open exit with visits>0 but target=None means the robot has used
+# that direction before but the graph never linked it to a destination node.
+# This is NOT a completed corridor. Prefer it locally before routing around the
+# graph, and also treat its owner as a pending exploration target globally.
+ENABLE_UNRESOLVED_EDGE_RECOVERY = True
+# One initial traversal + at most one recovery traversal is normally enough.
+# More repeated retries can make a cyclic maze look like the robot is "orbiting"
+# an island instead of heading to a remaining frontier.
+UNRESOLVED_EDGE_MAX_VISITS = 2
+
+# V10 cyclic-maze routing.
+# Local unvisited exits still win immediately. When the current junction has no
+# local work, route to the nearest pending junction using a weighted graph cost
+# that strongly penalizes already-repeated edges. This keeps Trémaux behaviour
+# but avoids blindly replaying a long DFS stack around an island.
+ENABLE_WEIGHTED_PENDING_ROUTING = True
+ROUTE_EDGE_BASE_COST = 1.0
+ROUTE_EDGE_VISIT_PENALTY = 1.75
+ROUTE_EDGE_HIGH_VISIT_EXTRA = 2.0
+ROUTE_PENDING_UNRESOLVED_EXTRA = 1.25
 
 # Preserve the actual traversal path through loops. A revisit to an older node
 # is appended to the stack unless it is a normal one-step backtrack.
@@ -322,6 +451,123 @@ STOP_WHEN_EXPLORATION_COMPLETE = True
 
 # Short pause before re-reading sensors at a detected junction.
 JUNCTION_SETTLE_SEC = 0.15
+
+
+
+
+# ============================================================
+# SLAM-STYLE MAPPING (PASSIVE - DOES NOT CONTROL THE ROBOT)
+# ============================================================
+ENABLE_MAPPING = True
+MAP_OUTPUT_DIR = "mapping_output"
+MAP_CLEAR_OUTPUT_ON_START = True
+
+# Raw RoboMaster odometry -> map frame.
+# From the real logs used in this project: logical EAST ~= -raw X,
+# logical NORTH ~= +raw Y. Change only these if the exported map is mirrored.
+MAP_SWAP_RAW_XY = False
+MAP_RAW_X_SIGN = -1.0
+MAP_RAW_Y_SIGN = +1.0
+MAP_POSITION_ROTATION_DEG = 0.0
+# V10: learn how RoboMaster raw X/Y are rotated relative to the maze from the
+# first straight run, then rotate the entire map so the initial corridor is +Y.
+MAP_AUTO_ALIGN_INITIAL_PATH = True
+MAP_AUTO_ALIGN_MIN_TRAVEL_M = 0.18
+MAP_AUTO_ALIGN_MAX_HEADING_INDEX = 0
+MAP_YAW_RIGHT_SIGN = +1.0
+MAP_YAW_CARDINAL_MAX_ERROR_DEG = 22.0
+MAP_FALLBACK_TO_CARDINAL_HEADING = True
+# Mapping rays use the logical N/E/S/W heading rather than ±1-3 deg of attitude
+# noise, so straight foam walls render as straight walls.
+MAP_SENSOR_USE_CARDINAL_HEADING = True
+MAP_MIN_RECORD_INTERVAL_SEC = 0.045
+MAP_MAX_SAMPLES = 60000
+
+# Occupancy grid. 2.5 cm gives a cleaner SLAM-like wall shape than the old 5 cm grid.
+MAP_RESOLUTION_M = 0.025
+MAP_EVIDENCE_MIN = -30
+MAP_EVIDENCE_MAX = +30
+MAP_OCCUPIED_SCORE_THRESHOLD = 4
+MAP_FREE_SCORE_THRESHOLD = -3
+MAP_ROBOT_FREE_RADIUS_M = 0.11
+MAP_ROBOT_FREE_SCORE = -3
+
+# Sensor mounting model. Measure these offsets later for best geometry.
+# local coordinates: +forward = robot front, +right = robot right.
+MAP_FRONT_SENSOR_ANGLE_DEG = 0.0
+MAP_LEFT_SENSOR_ANGLE_DEG = -90.0
+MAP_RIGHT_SENSOR_ANGLE_DEG = +90.0
+MAP_FRONT_SENSOR_FORWARD_M = 0.08
+MAP_FRONT_SENSOR_RIGHT_M = 0.0
+MAP_LEFT_SENSOR_FORWARD_M = 0.02
+MAP_LEFT_SENSOR_RIGHT_M = -0.10
+MAP_RIGHT_SENSOR_FORWARD_M = 0.02
+MAP_RIGHT_SENSOR_RIGHT_M = +0.10
+
+# Conservative ranges are intentional. Long ToF rays created triangular/diagonal
+# artefacts in earlier maps when odometry/yaw drifted. ToF now maps only nearby
+# front space/walls; Sharp is the primary side-wall source.
+MAP_TOF_MIN_CM = 4.0
+MAP_TOF_FREE_MAX_CM = 55.0
+MAP_TOF_OCCUPIED_MAX_CM = 45.0
+MAP_TOF_HIT_SCORE = 7
+MAP_TOF_FREE_SCORE = -1
+# A far ToF reading is useful for motion but makes ugly white "combs" when used
+# as a SLAM free-space ray. With no confirmed front hit, clear only a short
+# region in front of the robot; the swept robot footprint supplies the rest.
+MAP_TOF_NO_HIT_FREE_MAX_CM = 28.0
+
+MAP_SHARP_MIN_CM = 4.0
+MAP_SHARP_FREE_MAX_CM = 24.0
+MAP_SHARP_OCCUPIED_MAX_CM = 18.0
+MAP_SHARP_HIT_SCORE = 5
+MAP_SHARP_FREE_SCORE = -1
+
+# Digital IR is binary, so it is used mainly as WALL CONFIRMATION rather than
+# pretending it provides an exact range. Common IR modules are active-low.
+# If your log shows IR=1 when a wall is physically in front of the IR sensor,
+# change MAP_IR_WALL_LEVEL to 1.
+MAP_IR_WALL_LEVEL = 0
+MAP_IR_CONFIRM_LEFT_SHARP = True
+MAP_IR_CONFIRM_MAX_SHARP_CM = 22.0
+MAP_IR_CONFIRM_SCORE = 4
+
+# Optional only after measuring the IR mounting angle/range. It is OFF by default
+# because a binary IR sensor does not provide exact distance; using a guessed
+# endpoint can make the map look worse. IR still actively confirms Sharp walls.
+MAP_IR_FALLBACK_ENABLED = False
+MAP_IR_SENSOR_ANGLE_DEG = -45.0
+MAP_IR_SENSOR_FORWARD_M = 0.08
+MAP_IR_SENSOR_RIGHT_M = -0.07
+MAP_IR_ASSUMED_RANGE_M = 0.12
+MAP_IR_FALLBACK_HIT_SCORE = 1
+MAP_IR_FALLBACK_PATCH_RADIUS_CELLS = 1
+
+# Wall rendering/post-processing only. Raw occupancy evidence is preserved in CSV.
+MAP_DISPLAY_WALL_DILATION_CELLS = 1
+MAP_DISPLAY_BRIDGE_GAP_CELLS = 2
+MAP_DISPLAY_REMOVE_ISOLATED_WALLS = True
+# Connect consecutive confirmed wall hits only while the robot keeps the same
+# logical heading. This fills sensor-sampling gaps without bridging real doors.
+MAP_CONNECT_CONSECUTIVE_WALL_HITS = True
+MAP_WALL_CONNECT_MAX_M = 0.18
+MAP_WALL_CONNECT_SCORE = 4
+
+# Junction-based map-only loop closure. The controller pose is never modified.
+MAP_LOOP_CLOSURE_MIN_ERROR_M = 0.015
+MAP_LOOP_CLOSURE_MAX_ERROR_M = 0.35
+MAP_LOOP_CLOSURE_GAIN = 1.0
+MAP_SAVE_ON_JUNCTION = True
+MAP_AUTOSAVE_SEC = 0.0
+
+# Export. Unknown=gray, free=white, occupied=black, trajectory=blue.
+MAP_EXPORT_MARGIN_M = 0.30
+MAP_SVG_PX_PER_M = 420.0
+MAP_EXPORT_PNG = True
+MAP_PNG_DPI = 220
+MAP_DRAW_TRAJECTORY = True
+MAP_DRAW_NODES = True
+MAP_DRAW_EXIT = True
 
 
 # ============================================================
@@ -346,22 +592,27 @@ CALIBRATION_SHARP_RIGHT = list(CALIBRATION_SHARP_LEFT)
 CALIBRATION_SHARP2 = CALIBRATION_SHARP_LEFT
 
 # ============================================================
-# V7 FEEDBACK TURN / ACTION WATCHDOG
+# V8 FEEDBACK TURN / ACTION WATCHDOG
 # ============================================================
 # Normal 90/180 turns use attitude yaw + drive_speed closed-loop so the program
-# does not depend on an SDK action-completion ACK.
+# does not depend on an SDK action-completion ACK. Real attitude telemetry can
+# pause for a few samples, so V8 accepts a small final error at timeout and can
+# retry toward the SAME absolute target instead of adding another 90/180 deg.
 ENABLE_FEEDBACK_TURN = True
 TURN_PRE_SETTLE_SEC = 0.10
 TURN_FEEDBACK_KP = 1.20
 TURN_FEEDBACK_MIN_Z_SPEED = 10.0
 TURN_FEEDBACK_MAX_Z_SPEED = 55.0
-TURN_FEEDBACK_TOLERANCE_DEG = 2.0
-TURN_FEEDBACK_STABLE_SAMPLES = 3
+TURN_FEEDBACK_TOLERANCE_DEG = 4.0
+TURN_FEEDBACK_STABLE_SAMPLES = 2
 TURN_FEEDBACK_LOOP_SEC = 0.03
 TURN_FEEDBACK_DRIVE_TIMEOUT_SEC = 0.20
-TURN_FEEDBACK_TIMEOUT_90_SEC = 3.50
-TURN_FEEDBACK_TIMEOUT_180_SEC = 6.00
+TURN_FEEDBACK_TIMEOUT_90_SEC = 5.00
+TURN_FEEDBACK_TIMEOUT_180_SEC = 8.00
 TURN_FEEDBACK_PRINT_SEC = 0.25
+TURN_TIMEOUT_ACCEPT_TOLERANCE_DEG = 5.0
+TURN_MAX_ATTEMPTS = 3
+TURN_RETRY_SETTLE_SEC = 0.25
 
 # Fallback only if attitude yaw is unavailable. Even this path is bounded.
 TURN_ACTION_TIMEOUT_90_SEC = 3.50

@@ -1,1 +1,1 @@
-"""RoboMaster maze solver modules."""
+"""Modular RoboMaster Maze Explorer V10.1."""

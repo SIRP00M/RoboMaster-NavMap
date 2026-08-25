@@ -1,8 +1,13 @@
+"""Thread-safe RoboMaster odometry and attitude tracking."""
+
+import config
+
+# ==================== POSE TRACKER ====================
 """Thread-safe chassis position + attitude tracker."""
 
 import threading
 
-import config
+
 
 def normalize_angle_deg(angle):
     """Normalize angle to [-180, 180)."""

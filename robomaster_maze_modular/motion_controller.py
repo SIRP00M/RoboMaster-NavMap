@@ -1,9 +1,14 @@
+"""Forward, wall-centering, escape, and heading-hold control logic."""
+
+import config
+from pose_tracker import normalize_angle_deg, shortest_angle_error_deg
+
+# ==================== MOTION CONTROLLER ====================
 """Forward speed, side-wall and heading-hold motion controller."""
 
 import time
 
-import config
-from pose import normalize_angle_deg, shortest_angle_error_deg
+
 
 def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
@@ -23,6 +28,13 @@ class MotionController:
         self.heading_right_step_sign = None
         self.heading_recovering = False
 
+        # V10 external corridor reference for slow IMU-yaw drift correction.
+        self._corr_cal_x = None
+        self._corr_cal_y = None
+        self._corr_cal_left = None
+        self._corr_cal_right = None
+        self._corr_cal_heading_index = None
+
     # ========================================================
     # RESET / STATE
     # ========================================================
@@ -39,6 +51,14 @@ class MotionController:
         # Important: do NOT reset absolute heading target here.
         self.reset_side_owner()
         self.reset_wall_states()
+        self.reset_corridor_heading_calibration()
+
+    def reset_corridor_heading_calibration(self):
+        self._corr_cal_x = None
+        self._corr_cal_y = None
+        self._corr_cal_left = None
+        self._corr_cal_right = None
+        self._corr_cal_heading_index = None
 
     # ========================================================
     # HEADING HOLD
@@ -165,6 +185,109 @@ class MotionController:
             recover=False,
         )
         return x, y, z_cmd, mode, error
+
+    def update_corridor_heading_reference(
+        self,
+        left_cm,
+        right_cm,
+        front_cm,
+        pose_tracker,
+        heading_index,
+        allow=True,
+    ):
+        """Slowly trim the absolute yaw grid from straight-wall geometry.
+
+        A decreasing LEFT distance means the chassis is pointing into the left
+        wall; an increasing RIGHT distance says the same thing.  Convert that
+        physical skew into the attitude-yaw sign learned for a logical RIGHT
+        turn, then move heading_base_yaw/target_yaw only a small amount.
+        """
+        if not getattr(config, "ENABLE_CORRIDOR_HEADING_CALIBRATION", False):
+            return None
+        if not allow or pose_tracker is None:
+            self.reset_corridor_heading_calibration()
+            return None
+        if front_cm is None or front_cm < config.CORRIDOR_CAL_MIN_FRONT_CM:
+            self.reset_corridor_heading_calibration()
+            return None
+        if self.heading_right_step_sign not in (-1, 1):
+            return None
+
+        x, y, _ = pose_tracker.get_pose()
+        if x is None or y is None:
+            return None
+
+        def wall_ok(v):
+            return (
+                v is not None
+                and config.CORRIDOR_CAL_MIN_WALL_CM <= v <= config.CORRIDOR_CAL_MAX_WALL_CM
+            )
+
+        left_ok = wall_ok(left_cm)
+        right_ok = wall_ok(right_cm)
+        if not (left_ok or right_ok):
+            self.reset_corridor_heading_calibration()
+            return None
+
+        if (
+            self._corr_cal_x is None
+            or self._corr_cal_heading_index != int(heading_index)
+        ):
+            self._corr_cal_x, self._corr_cal_y = x, y
+            self._corr_cal_left = float(left_cm) if left_ok else None
+            self._corr_cal_right = float(right_cm) if right_ok else None
+            self._corr_cal_heading_index = int(heading_index)
+            return None
+
+        travel = ((x - self._corr_cal_x) ** 2 + (y - self._corr_cal_y) ** 2) ** 0.5
+        if travel < config.CORRIDOR_CAL_MIN_TRAVEL_M:
+            return None
+
+        import math
+        estimates = []
+        # Positive estimate below means an attitude-yaw adjustment in the
+        # direction required to bring the chassis parallel to the wall.
+        if left_ok and self._corr_cal_left is not None:
+            dd_m = (float(left_cm) - self._corr_cal_left) / 100.0
+            a = math.degrees(math.atan2(dd_m, max(travel, 1e-6)))
+            # LEFT distance increasing -> chassis points right -> correct left.
+            estimates.append(-self.heading_right_step_sign * a)
+        if right_ok and self._corr_cal_right is not None:
+            dd_m = (float(right_cm) - self._corr_cal_right) / 100.0
+            a = math.degrees(math.atan2(dd_m, max(travel, 1e-6)))
+            # RIGHT distance increasing -> chassis points left -> correct right.
+            estimates.append(self.heading_right_step_sign * a)
+
+        # Start a fresh baseline whether or not this estimate is accepted.
+        self._corr_cal_x, self._corr_cal_y = x, y
+        self._corr_cal_left = float(left_cm) if left_ok else None
+        self._corr_cal_right = float(right_cm) if right_ok else None
+        self._corr_cal_heading_index = int(heading_index)
+
+        if not estimates:
+            return None
+        estimate = sum(estimates) / len(estimates)
+        if abs(estimate) > config.CORRIDOR_CAL_MAX_ESTIMATE_DEG:
+            return None
+
+        step = clamp(
+            estimate * config.CORRIDOR_CAL_ALPHA,
+            -config.CORRIDOR_CAL_MAX_STEP_DEG,
+            config.CORRIDOR_CAL_MAX_STEP_DEG,
+        )
+        if abs(step) < 0.02:
+            return step
+
+        self.heading_base_yaw = normalize_angle_deg(self.heading_base_yaw + step)
+        if self.heading_target_yaw is not None:
+            self.heading_target_yaw = normalize_angle_deg(self.heading_target_yaw + step)
+
+        if abs(step) >= config.CORRIDOR_CAL_LOG_MIN_STEP_DEG:
+            print(
+                f">>> CORRIDOR_HEADING_CAL estimate={estimate:+.2f}deg "
+                f"trim={step:+.2f}deg target={self.heading_target_yaw:+.2f}"
+            )
+        return step
 
     # ========================================================
     # FRONT SPEED CONTROL
