@@ -3,13 +3,18 @@
 Features
 --------
 - Draw maze walls on a grid with the mouse.
-- Place START, PICKUP, DROP and EXIT hints.
+- Place START, PICKUP, DROP and EXIT hints; PICKUP/DROP/EXIT are optional.
+- Missions may start already carrying an object: START -> DROP -> EXIT.
+- A START-only design can still export a topology guide for DFS/mapping.
 - Draw in any orientation; the robot tests all 4 rotations and both mirrors.
-- Preview the mission route START -> PICKUP -> DROP -> EXIT with A*.
+- Preview whatever mission stages are present with A*.
+- Left-click adds walls; right-click removes walls or markers.
+- Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo.
 - Resize the grid (Rows x Columns) from the GUI.
 - Coordinates use (0,0) at the bottom-left.
 - Fine marker placement: START/PICKUP/DROP/EXIT can be placed with sub-cell
   precision by click position, absolute X/Y, or exact distance from cell walls.
+- Motion Profile supports AUTO braking calculation or MANUAL slow/stop distances.
 - Save/load the maze as JSON.
 - Export a topology-first guide. Grid-cell count and metres are hints only;
   live sensors remain authoritative.
@@ -26,13 +31,7 @@ import argparse
 import heapq
 import json
 import os
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
-=======
-import sys
-import copy
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
 import tkinter as tk
-import customtkinter as ctk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -77,12 +76,27 @@ class MazeData:
     drop_pos_m: Optional[PosM] = None
     goal_pos_m: Optional[PosM] = None
 
+    # Motion profile exported with the route. AUTO computes conservative
+    # slow/brake trigger distances from speed and a simple braking model.
+    motion_mode: str = "AUTO"
+    forward_speed_mps: float = 0.20
+    manual_slow_front_cm: float = 18.0
+    manual_stop_front_cm: float = 15.0
+    auto_reaction_time_s: float = 0.15
+    auto_brake_decel_mps2: float = 0.45
+    auto_safety_margin_cm: float = 3.0
+    auto_clearance_cm: float = 11.0
+    auto_slow_ramp_time_s: float = 0.40
+
     def __post_init__(self):
         if self.walls is None:
             self.walls = set()
         self.start_heading = str(self.start_heading).upper()
         if self.start_heading not in HEADINGS:
             self.start_heading = "N"
+        self.motion_mode = str(self.motion_mode).upper()
+        if self.motion_mode not in ("AUTO", "MANUAL"):
+            self.motion_mode = "AUTO"
         self._sync_all_marker_pose_and_cells()
 
     @staticmethod
@@ -234,6 +248,17 @@ class MazeData:
             "exit_pose_m": self._pose_dict(self.goal_pos_m),
             "goal": list(self.goal) if self.goal is not None else None,
             "goal_pose_m": self._pose_dict(self.goal_pos_m),
+            "motion_settings": {
+                "mode": self.motion_mode,
+                "forward_speed_mps": self.forward_speed_mps,
+                "manual_slow_front_cm": self.manual_slow_front_cm,
+                "manual_stop_front_cm": self.manual_stop_front_cm,
+                "auto_reaction_time_s": self.auto_reaction_time_s,
+                "auto_brake_decel_mps2": self.auto_brake_decel_mps2,
+                "auto_safety_margin_cm": self.auto_safety_margin_cm,
+                "auto_clearance_cm": self.auto_clearance_cm,
+                "auto_slow_ramp_time_s": self.auto_slow_ramp_time_s,
+            },
         }
 
     @classmethod
@@ -259,6 +284,7 @@ class MazeData:
         goal_value = data.get("exit")
         if goal_value is None:
             goal_value = data.get("goal")
+        motion = data.get("motion_settings") or {}
 
         maze = cls(
             rows=rows,
@@ -273,6 +299,15 @@ class MazeData:
             object_pos_m=cls._read_pose(data, "pickup_pose_m", "object_pose_m"),
             drop_pos_m=cls._read_pose(data, "drop_pose_m"),
             goal_pos_m=cls._read_pose(data, "exit_pose_m", "goal_pose_m"),
+            motion_mode=str(motion.get("mode", "AUTO")),
+            forward_speed_mps=float(motion.get("forward_speed_mps", 0.20)),
+            manual_slow_front_cm=float(motion.get("manual_slow_front_cm", 18.0)),
+            manual_stop_front_cm=float(motion.get("manual_stop_front_cm", 15.0)),
+            auto_reaction_time_s=float(motion.get("auto_reaction_time_s", 0.15)),
+            auto_brake_decel_mps2=float(motion.get("auto_brake_decel_mps2", 0.45)),
+            auto_safety_margin_cm=float(motion.get("auto_safety_margin_cm", 3.0)),
+            auto_clearance_cm=float(motion.get("auto_clearance_cm", 11.0)),
+            auto_slow_ramp_time_s=float(motion.get("auto_slow_ramp_time_s", 0.40)),
         )
 
         for item in data.get("walls", []):
@@ -592,6 +627,41 @@ def build_topology_guide(maze: MazeData) -> dict:
     }
 
 
+def topology_preview_edges(plan: dict) -> List[Tuple[Cell, Cell]]:
+    """Return unique topology graph edges as cell pairs for GUI preview.
+
+    This is deliberately independent from the mission route. Therefore a maze
+    with START only (no PICKUP/DROP/EXIT) can still show the complete guide that
+    the runtime DFS/topology matcher will use.
+    """
+    guide = plan.get("topology_guide") or {}
+    nodes = guide.get("nodes") or {}
+    id_to_cell: Dict[str, Cell] = {}
+    for node_id, node in nodes.items():
+        cell = node.get("cell")
+        if isinstance(cell, (list, tuple)) and len(cell) >= 2:
+            id_to_cell[str(node_id)] = (int(cell[0]), int(cell[1]))
+
+    edges: List[Tuple[Cell, Cell]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for node_id, node in nodes.items():
+        a_id = str(node_id)
+        a_cell = id_to_cell.get(a_id)
+        if a_cell is None:
+            continue
+        for exit_info in (node.get("exits") or {}).values():
+            b_id = str(exit_info.get("target"))
+            b_cell = id_to_cell.get(b_id)
+            if b_cell is None:
+                continue
+            key = tuple(sorted((a_id, b_id)))
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append((a_cell, b_cell))
+    return edges
+
+
 def marker_positions_for_export(maze: MazeData) -> dict:
     def pack(cell: Optional[Cell], pos: Optional[PosM]):
         if cell is None and pos is None:
@@ -618,27 +688,107 @@ def marker_positions_for_export(maze: MazeData) -> dict:
     }
 
 
+def calculate_motion_profile(maze: MazeData) -> dict:
+    """Return the route's front braking profile.
+
+    AUTO model:
+      reaction_distance = v * reaction_time
+      braking_distance  = v^2 / (2*a)
+      stop_trigger      = desired_clearance + reaction + braking + safety_margin
+      slow_trigger      = stop_trigger + max(5 cm, v * slow_ramp_time)
+    """
+    v = float(maze.forward_speed_mps)
+    if not 0.03 <= v <= 0.60:
+        raise ValueError("Forward speed must be between 0.03 and 0.60 m/s")
+
+    mode = str(maze.motion_mode).upper()
+    if mode == "MANUAL":
+        stop_cm = float(maze.manual_stop_front_cm)
+        slow_cm = float(maze.manual_slow_front_cm)
+        if not 5.0 <= stop_cm <= 150.0:
+            raise ValueError("Manual brake/stop trigger must be between 5 and 150 cm")
+        if not stop_cm + 1.0 <= slow_cm <= 250.0:
+            raise ValueError("Manual slow trigger must be at least 1 cm farther than brake/stop trigger")
+        return {
+            "mode": "MANUAL",
+            "forward_speed_mps": round(v, 4),
+            "slow_front_cm": round(slow_cm, 2),
+            "stop_front_cm": round(stop_cm, 2),
+            "min_forward_speed_mps": round(min(0.05, max(0.03, v * 0.25)), 4),
+            "calculation": "USER_DEFINED",
+        }
+
+    reaction = float(maze.auto_reaction_time_s)
+    decel = float(maze.auto_brake_decel_mps2)
+    margin_cm = float(maze.auto_safety_margin_cm)
+    clearance_cm = float(maze.auto_clearance_cm)
+    ramp_time = float(maze.auto_slow_ramp_time_s)
+    if not 0.02 <= reaction <= 1.0:
+        raise ValueError("Auto reaction time must be between 0.02 and 1.0 s")
+    if not 0.10 <= decel <= 3.0:
+        raise ValueError("Auto brake deceleration must be between 0.10 and 3.0 m/s^2")
+    if not 0.0 <= margin_cm <= 50.0:
+        raise ValueError("Auto safety margin must be between 0 and 50 cm")
+    if not 5.0 <= clearance_cm <= 80.0:
+        raise ValueError("Auto desired clearance must be between 5 and 80 cm")
+    if not 0.05 <= ramp_time <= 2.0:
+        raise ValueError("Auto slow-ramp time must be between 0.05 and 2.0 s")
+
+    reaction_m = v * reaction
+    braking_m = (v * v) / (2.0 * decel)
+    stop_cm = clearance_cm + margin_cm + 100.0 * (reaction_m + braking_m)
+    slow_extra_cm = max(5.0, 100.0 * v * ramp_time)
+    slow_cm = stop_cm + slow_extra_cm
+    return {
+        "mode": "AUTO",
+        "forward_speed_mps": round(v, 4),
+        "slow_front_cm": round(slow_cm, 2),
+        "stop_front_cm": round(stop_cm, 2),
+        "min_forward_speed_mps": round(min(0.05, max(0.03, v * 0.25)), 4),
+        "calculation": {
+            "reaction_time_s": reaction,
+            "brake_deceleration_mps2": decel,
+            "safety_margin_cm": margin_cm,
+            "desired_clearance_cm": clearance_cm,
+            "slow_ramp_time_s": ramp_time,
+            "reaction_distance_cm": round(reaction_m * 100.0, 2),
+            "braking_distance_cm": round(braking_m * 100.0, 2),
+            "slow_ramp_extra_cm": round(slow_extra_cm, 2),
+        },
+    }
+
+
 def validate_and_plan(maze: MazeData) -> dict:
-    errors = []
+    """Compile a flexible mission route plus a topology guide.
+
+    START is the only mandatory marker. PICKUP, DROP and EXIT are optional:
+
+    - START -> PICKUP -> DROP -> EXIT : normal pickup mission
+    - START -> DROP -> EXIT           : robot starts with the object already
+    - START -> EXIT                   : navigation-only mission
+    - START only                      : topology/mapping guide only; runtime DFS
+      can explore without a pre-drawn mission target
+
+    This keeps the designer useful even when the field rules give the robot the
+    object before the run, or when the drawing is used only as a soft map hint.
+    """
     if maze.start is None:
-        errors.append("START is not set")
-    if maze.object_cell is None:
-        errors.append("PICKUP is not set")
-    if maze.goal is None:
-        errors.append("EXIT is not set")
-    if errors:
-        raise ValueError("; ".join(errors))
+        raise ValueError("START is not set")
 
     mission_points = [("START", maze.start)]
-    mission_points.append(("PICKUP", maze.object_cell))
-    if maze.drop_cell is not None:
-        mission_points.append(("DROP", maze.drop_cell))
-    mission_points.append(("EXIT", maze.goal))
+    for name, cell in (
+        ("PICKUP", maze.object_cell),
+        ("DROP", maze.drop_cell),
+        ("EXIT", maze.goal),
+    ):
+        if cell is not None:
+            mission_points.append((name, cell))
 
-    path: List[Cell] = []
+    # START-only is valid: it exports a topology guide and an empty motion route.
+    path: List[Cell] = [maze.start]
     leg_summaries = []
-    for (from_name, start), (to_name, target) in zip(mission_points, mission_points[1:]):
-        leg = astar(maze, start, target)
+    for (from_name, leg_start), (to_name, target) in zip(mission_points, mission_points[1:]):
+        leg = astar(maze, leg_start, target)
         if leg is None:
             raise ValueError(f"No path from {from_name} to {to_name}")
         path = merge_paths(path, leg)
@@ -650,16 +800,40 @@ def validate_and_plan(maze: MazeData) -> dict:
             }
         )
 
-    inferred_heading = direction_between(path[0], path[1]) if len(path) >= 2 else "N"
+    inferred_heading = direction_between(path[0], path[1]) if len(path) >= 2 else maze.start_heading
     segments = route_segments(path, inferred_heading)
     actions = decision_actions(maze, path, inferred_heading)
     topology_guide = build_topology_guide(maze)
 
+    starts_with_object = maze.object_cell is None and maze.drop_cell is not None
+    if maze.object_cell is not None:
+        mission_mode = "PICKUP_MISSION"
+    elif maze.drop_cell is not None:
+        mission_mode = "START_WITH_OBJECT"
+    elif maze.goal is not None:
+        mission_mode = "NAVIGATION_ONLY"
+    else:
+        mission_mode = "MAPPING_ONLY"
+
     warnings = []
-    if maze.drop_cell is None:
+    if starts_with_object:
         warnings.append(
-            "DROP is not set; mission guide will use START -> PICKUP -> EXIT."
+            "PICKUP is not set; mission assumes the robot STARTS WITH THE OBJECT and routes directly to DROP."
         )
+    elif maze.object_cell is None and maze.drop_cell is None and maze.goal is not None:
+        warnings.append("PICKUP/DROP are not set; mission is navigation-only: START -> EXIT.")
+    elif maze.object_cell is None and maze.drop_cell is None and maze.goal is None:
+        warnings.append(
+            "No mission target is set after START; export is topology/mapping-only and runtime exploration/DFS may choose the path."
+        )
+
+    if maze.object_cell is not None and maze.drop_cell is None:
+        warnings.append("DROP is not set; mission skips DROP and continues to the next configured stage.")
+    if maze.goal is None:
+        warnings.append(
+            "EXIT is not set; the pre-drawn route ends at the last configured marker, but the topology guide can still be used for exploration/mapping."
+        )
+
     for marker_name, cell in mission_points[1:]:
         headings = open_headings(maze, cell)
         if len(headings) == 2:
@@ -672,18 +846,22 @@ def validate_and_plan(maze: MazeData) -> dict:
                 )
 
     return {
-        "format": "robomaster_known_route_v5",
+        "format": "robomaster_known_route_v6",
         "coordinate_origin": "BOTTOM_LEFT",
         "coordinate_order": "ROW_Y_COL_X",
+        "mission_mode": mission_mode,
+        "starts_with_object": starts_with_object,
+        "mission_order": [name for name, _ in mission_points[1:]],
         "maze": maze.to_dict(),
         "marker_positions": marker_positions_for_export(maze),
         "topology_guide": topology_guide,
         "path": [list(c) for c in path],
         "mission_legs": leg_summaries,
-        "total_cells": len(path) - 1,
-        "total_distance_m": (len(path) - 1) * maze.cell_size_m,
+        "total_cells": max(0, len(path) - 1),
+        "total_distance_m": max(0, len(path) - 1) * maze.cell_size_m,
         "segments": segments,
         "decision_actions": actions,
+        "motion_profile": calculate_motion_profile(maze),
         "warnings": warnings,
     }
 
@@ -707,214 +885,80 @@ def save_plan(path: str, plan: dict) -> None:
 # GUI
 # -----------------------------------------------------------------------------
 
-
-try:
-    from PIL import Image, ImageTk, ImageGrab
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
 class MazeDesignerApp:
     CELL_PX = 62
     PAD = 28
     EDGE_PICK_PX = 12
 
-    def __init__(self, root: ctk.CTk, rows: int = 8, cols: int = 10, cell_size_m: float = 0.40):
+    def __init__(self, root: tk.Tk, rows: int = 8, cols: int = 10, cell_size_m: float = 0.40):
         self.root = root
-        self.root.title("RoboMaster Pre-drawn Maze Designer (Y2K Edition + Pro)")
-        
-        # Y2K Theme Colors
-        self.color_bg = "#d6e5ff"       
-        self.color_sidebar = "#7ea8f8"  
-        self.color_text = "#1f2a63"     
-        self.color_btn_green = "#b1f071" 
-        self.color_btn_yellow = "#fff785" 
-        self.color_btn_hover = "#95d654"
-        self.color_yellow_hover = "#e6de65"
-        self.color_border = "#1f2a63"
-        
-        ctk.set_appearance_mode("Light")
-        self.root.configure(fg_color=self.color_bg)
-        
-        self.font_main = ctk.CTkFont(family="Courier New", size=14, weight="bold")
-        self.font_title = ctk.CTkFont(family="Courier New", size=22, weight="bold")
-        
+        self.root.title("RoboMaster Pre-drawn Maze Designer")
         self.maze = MazeData(rows=rows, cols=cols, cell_size_m=cell_size_m)
         self.mode = tk.StringVar(value="WALL")
-        self.status = tk.StringVar(value="Ready! Use W/E/S/P/D/X keys to switch modes.")
+        self.status = tk.StringVar(value="Draw walls; START is required. PICKUP / DROP / EXIT are optional mission stages.")
         self.route: List[Cell] = []
+        # Full topology preview is separate from the mission path. This lets
+        # START-only designs show a useful guide without requiring PICKUP.
+        self.guide_edges: List[Tuple[Cell, Cell]] = []
         self.route_plan: Optional[dict] = None
         self.current_file: Optional[str] = None
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
         self.fine_marker_mode = tk.BooleanVar(value=True)
         self.marker_x_ref = tk.StringVar(value="LEFT")
         self.marker_y_ref = tk.StringVar(value="TOP")
         self.marker_measure_text = tk.StringVar(value="Select a marker or click inside a cell")
 
+        self.motion_mode_var = tk.StringVar(value=self.maze.motion_mode)
+        self.forward_speed_var = tk.StringVar(value=f"{self.maze.forward_speed_mps:.2f}")
+        self.manual_slow_var = tk.StringVar(value=f"{self.maze.manual_slow_front_cm:.1f}")
+        self.manual_stop_var = tk.StringVar(value=f"{self.maze.manual_stop_front_cm:.1f}")
+        self.auto_reaction_var = tk.StringVar(value=f"{self.maze.auto_reaction_time_s:.2f}")
+        self.auto_decel_var = tk.StringVar(value=f"{self.maze.auto_brake_decel_mps2:.2f}")
+        self.auto_margin_var = tk.StringVar(value=f"{self.maze.auto_safety_margin_cm:.1f}")
+        self.auto_clearance_var = tk.StringVar(value=f"{self.maze.auto_clearance_cm:.1f}")
+        self.auto_ramp_var = tk.StringVar(value=f"{self.maze.auto_slow_ramp_time_s:.2f}")
+        self.motion_result_var = tk.StringVar(value="")
+        self.motion_panel_visible = tk.BooleanVar(value=False)
+        self.motion_toggle_text = tk.StringVar(value="Show Motion Profile")
+
+        # Full maze edit history. A snapshot is stored BEFORE every mutation so
+        # Ctrl+Z can recover walls, markers, fine positions, grid resize, cell
+        # size and START heading changes. Route preview itself is not history.
+        self.undo_stack: List[dict] = []
+        self.redo_stack: List[dict] = []
+        self.history_limit = 150
+
         self._build_ui()
         self.mode.trace_add("write", lambda *_: self.current_mode_changed_marker())
         self.marker_x_ref.trace_add("write", lambda *_: self.refresh_relative_marker_fields())
         self.marker_y_ref.trace_add("write", lambda *_: self.refresh_relative_marker_fields())
+        self.root.bind_all("<Control-z>", self.undo)
+        self.root.bind_all("<Control-y>", self.redo)
+        self.root.bind_all("<Control-Shift-Z>", self.redo)
+        self.root.bind_all("<Control-Shift-z>", self.redo)
+        self.root.bind_all("<Delete>", self.delete_selected_marker)
         self._resize_canvas()
-=======
-        self.appearance_mode = "Light"
-        
-        # --- NEW: History System ---
-        self.history_undo = []
-        self.history_redo = []
-        
-        # --- NEW: Animation System ---
-        self.anim_id = None
-        self.anim_index = 0
-        self.robot_image = None
-        self.robot_frames = []
-        self.current_frame_idx = 0
-        self.gif_anim_id = None
-        self.load_icon()
-
-        self._build_ui()
-        self._resize_window()
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
         self.redraw()
-        
-        # --- NEW: Key Bindings ---
-        self.root.bind("<Control-z>", self.undo)
-        self.root.bind("<Control-y>", self.redo)
-        self.root.bind("<Key>", self.on_key_press)
-        self.root.bind("<Button-1>", lambda e: self.root.focus_set())
-
-    def load_icon(self):
-        if HAS_PIL:
-            assets_dir = os.path.join(os.path.dirname(__file__), "assets")
-            if not os.path.exists(assets_dir): return
-            for f in os.listdir(assets_dir):
-                if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
-                    path = os.path.join(assets_dir, f)
-                    try:
-                        img = Image.open(path)
-                        is_gif = f.lower().endswith(".gif")
-                        size = int(self.CELL_PX * 3.2)
-                        
-                        try:
-                            while True:
-                                frame = img.convert("RGBA")
-                                data = frame.getdata()
-                                new_data = []
-                                for item in data:
-                                    if item[0] > 235 and item[1] > 235 and item[2] > 235:
-                                        new_data.append((255, 255, 255, 0))
-                                    elif item[0] < 150 and item[1] > 200 and item[2] < 150:
-                                        new_data.append((0, 255, 0, 0))
-                                    else:
-                                        new_data.append(item)
-                                frame.putdata(new_data)
-                                frame = frame.resize((size, size), Image.Resampling.LANCZOS)
-                                self.robot_frames.append(ImageTk.PhotoImage(frame))
-                                
-                                if not is_gif: break
-                                img.seek(img.tell() + 1)
-                        except EOFError:
-                            pass
-                            
-                        if self.robot_frames:
-                            self.robot_image = self.robot_frames[0]
-                        break
-                    except Exception as e:
-                        print(f"Error loading icon: {e}")
-
-    def update_gif_frame(self):
-        if not hasattr(self, 'robot_frames') or len(self.robot_frames) <= 1:
-            return
-        # Stop animating if route finished
-        if self.anim_index >= len(self.route):
-            return
-            
-        self.current_frame_idx = (self.current_frame_idx + 1) % len(self.robot_frames)
-        self.robot_image = self.robot_frames[self.current_frame_idx]
-        
-        if self.canvas.find_withtag("robot"):
-            self.canvas.itemconfig("robot", image=self.robot_image)
-            
-        self.gif_anim_id = self.root.after(80, self.update_gif_frame)
-
-    def save_state(self):
-        self.history_undo.append(copy.deepcopy(self.maze))
-        self.history_redo.clear()
-
-    def undo(self, event=None):
-        if self.history_undo:
-            self.history_redo.append(copy.deepcopy(self.maze))
-            self.maze = self.history_undo.pop()
-            self.clear_route()
-            self.status.set("Undo successful.")
-            self.redraw()
-
-    def redo(self, event=None):
-        if self.history_redo:
-            self.history_undo.append(copy.deepcopy(self.maze))
-            self.maze = self.history_redo.pop()
-            self.clear_route()
-            self.status.set("Redo successful.")
-            self.redraw()
-
-    def on_key_press(self, event):
-        if isinstance(event.widget, (tk.Entry, ctk.CTkEntry)):
-            return
-        if not event.char: return
-        char = event.char.lower()
-        if char == 'w': self.mode.set("WALL")
-        elif char == 'e': self.mode.set("ERASE")
-        elif char == 's': self.mode.set("START")
-        elif char == 'p': self.mode.set("PICKUP")
-        elif char == 'd': self.mode.set("DROP")
-        elif char == 'x': self.mode.set("EXIT")
 
     def _build_ui(self):
-        self.root.grid_rowconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=1)
-
-        # Sidebar
-        self.sidebar_frame = ctk.CTkFrame(
-            self.root, width=240, corner_radius=10, 
-            fg_color=self.color_sidebar, border_width=3, border_color=self.color_border
-        )
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        self.sidebar_frame.grid_rowconfigure(11, weight=1)
-
-        logo_label = ctk.CTkLabel(
-            self.sidebar_frame, text="E kae\nMaze Designer", 
-            font=self.font_title, text_color="white"
-        )
-        logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
-
-        # Mode Selection
-        self.mode_label = ctk.CTkLabel(
-            self.sidebar_frame, text="* DRAWING MODE *", anchor="w", 
-            font=self.font_main, text_color="white"
-        )
-        self.mode_label.grid(row=1, column=0, padx=20, pady=(10, 5), sticky="w")
+        top = tk.Frame(self.root, padx=8, pady=7)
+        top.pack(fill="x")
 
         modes = [
-            ("Wall (W)", "WALL"),
-            ("Erase (E)", "ERASE"),
-            ("Start (S)", "START"),
-            ("Pickup (P)", "PICKUP"),
-            ("Drop (D)", "DROP"),
-            ("Exit (X)", "EXIT"),
+            ("Wall", "WALL"),
+            ("Erase wall", "ERASE"),
+            ("Erase marker", "ERASE_MARKER"),
+            ("Start", "START"),
+            ("Pickup", "PICKUP"),
+            ("Drop", "DROP"),
+            ("Exit", "EXIT"),
         ]
-        
-        self.radio_buttons = []
-        for i, (text, value) in enumerate(modes):
-            rb = ctk.CTkRadioButton(
-                self.sidebar_frame, text=text.upper(), variable=self.mode, value=value,
-                font=self.font_main, text_color="white",
-                fg_color=self.color_btn_yellow, border_color="white", hover_color=self.color_btn_green
-            )
-            rb.grid(row=2+i, column=0, pady=6, padx=30, sticky="w")
-            self.radio_buttons.append(rb)
+        for text, value in modes:
+            tk.Radiobutton(top, text=text, value=value, variable=self.mode, indicatoron=False, width=11).pack(side="left", padx=2)
 
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
         tk.Button(top, text="Preview Guide", command=self.preview_route).pack(side="left", padx=(10, 2))
         tk.Button(top, text="Clear Route", command=self.clear_route).pack(side="left", padx=2)
+        tk.Button(top, text="Undo", command=self.undo).pack(side="left", padx=(10, 2))
+        tk.Button(top, text="Redo", command=self.redo).pack(side="left", padx=2)
         tk.Button(top, text="Rotate Start Heading", command=self.rotate_start).pack(side="left", padx=(10, 2))
 
         second = tk.Frame(self.root, padx=8, pady=3)
@@ -929,6 +973,7 @@ class MazeDesignerApp:
         self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
         self.cell_size_entry.pack(side="left")
         tk.Button(second, text="Apply", command=self.apply_cell_size).pack(side="left", padx=3)
+        tk.Button(second, textvariable=self.motion_toggle_text, command=self.toggle_motion_panel).pack(side="left", padx=(12, 2))
 
         gridbar = tk.Frame(self.root, padx=8, pady=3)
         gridbar.pack(fill="x")
@@ -947,6 +992,36 @@ class MazeDesignerApp:
             text="Coordinate origin: (0,0) = bottom-left   |   row ↑ north   |   column → east",
             fg="#555555",
         ).pack(side="left", padx=(14, 2))
+
+        self.motion = tk.LabelFrame(self.root, text="Motion Profile / Front braking", padx=8, pady=5)
+        tk.Label(self.motion, text="Cruise speed (m/s):").grid(row=0, column=0, sticky="w")
+        tk.Entry(self.motion, textvariable=self.forward_speed_var, width=7).grid(row=0, column=1, padx=(3, 12))
+        tk.Radiobutton(self.motion, text="AUTO", value="AUTO", variable=self.motion_mode_var, command=self._motion_mode_changed).grid(row=0, column=2, sticky="w")
+        tk.Radiobutton(self.motion, text="MANUAL", value="MANUAL", variable=self.motion_mode_var, command=self._motion_mode_changed).grid(row=0, column=3, sticky="w", padx=(4, 12))
+        tk.Button(self.motion, text="Calculate / Apply", command=self.apply_motion_settings).grid(row=0, column=4, padx=4)
+        tk.Label(self.motion, textvariable=self.motion_result_var, anchor="w").grid(row=0, column=5, sticky="w", padx=(10, 0))
+
+        self.manual_frame = tk.Frame(self.motion)
+        self.manual_frame.grid(row=1, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        tk.Label(self.manual_frame, text="Manual slow trigger (cm):").pack(side="left")
+        tk.Entry(self.manual_frame, textvariable=self.manual_slow_var, width=7).pack(side="left", padx=(3, 10))
+        tk.Label(self.manual_frame, text="Brake/stop trigger (cm):").pack(side="left")
+        tk.Entry(self.manual_frame, textvariable=self.manual_stop_var, width=7).pack(side="left", padx=(3, 10))
+
+        self.auto_frame = tk.Frame(self.motion)
+        self.auto_frame.grid(row=2, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        tk.Label(self.auto_frame, text="Auto model: reaction(s)").pack(side="left")
+        tk.Entry(self.auto_frame, textvariable=self.auto_reaction_var, width=6).pack(side="left", padx=(3, 8))
+        tk.Label(self.auto_frame, text="decel(m/s²)").pack(side="left")
+        tk.Entry(self.auto_frame, textvariable=self.auto_decel_var, width=6).pack(side="left", padx=(3, 8))
+        tk.Label(self.auto_frame, text="margin(cm)").pack(side="left")
+        tk.Entry(self.auto_frame, textvariable=self.auto_margin_var, width=6).pack(side="left", padx=(3, 8))
+        tk.Label(self.auto_frame, text="clearance(cm)").pack(side="left")
+        tk.Entry(self.auto_frame, textvariable=self.auto_clearance_var, width=6).pack(side="left", padx=(3, 8))
+        tk.Label(self.auto_frame, text="slow ramp(s)").pack(side="left")
+        tk.Entry(self.auto_frame, textvariable=self.auto_ramp_var, width=6).pack(side="left", padx=(3, 8))
+        self._motion_mode_changed()
+        self.apply_motion_settings(show_errors=False, record_history=False)
 
         markerbar = tk.Frame(self.root, padx=8, pady=3)
         markerbar.pack(fill="x")
@@ -987,155 +1062,60 @@ class MazeDesignerApp:
         info = tk.Label(
             self.root,
             text=(
-                "WALL/ERASE: click near an internal cell edge. Markers: click inside a cell.  "
-                "Coordinates use (row, column) with (0,0) at bottom-left.  "
-                "Fine placement can use exact click/absolute X-Y or distance from LEFT/RIGHT + TOP/BOTTOM walls inside that cell."
+                "Mouse: LEFT near edge = add wall, RIGHT near edge = remove wall; RIGHT on S/P/D/E = erase marker.  "
+                "PICKUP/DROP/EXIT are optional; START-only can preview/export the full topology/DFS guide.  "
+                "Ctrl+Z Undo, Ctrl+Y/Ctrl+Shift+Z Redo.  Coordinates: (0,0) bottom-left.  "
+                "Fine placement supports exact click/absolute X-Y or LEFT/RIGHT + TOP/BOTTOM wall distance."
             ),
             anchor="w",
             padx=10,
-=======
-        # Actions
-        actions_label = ctk.CTkLabel(
-            self.sidebar_frame, text="* ACTIONS *", anchor="w", 
-            font=self.font_main, text_color="white"
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
+            wraplength=1200,
+            justify="left",
         )
-        actions_label.grid(row=8, column=0, padx=20, pady=(15, 0), sticky="w")
+        info.pack(fill="x")
 
-        self.btn_preview = ctk.CTkButton(
-            self.sidebar_frame, text="PREVIEW ANIMATION", command=self.preview_route,
-            font=self.font_main, fg_color=self.color_btn_green, text_color=self.color_text,
-            border_width=2, border_color=self.color_border, hover_color=self.color_btn_hover, corner_radius=15
-        )
-        self.btn_preview.grid(row=9, column=0, padx=20, pady=5)
-        
-        self.btn_clear = ctk.CTkButton(
-            self.sidebar_frame, text="CLEAR ANIMATION", command=self.clear_route, 
-            font=self.font_main, fg_color=self.color_btn_yellow, text_color=self.color_text,
-            border_width=2, border_color=self.color_border, hover_color=self.color_yellow_hover, corner_radius=15
-        )
-        self.btn_clear.grid(row=10, column=0, padx=20, pady=5)
-        
-        # Undo/Redo
-        ur_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
-        ur_frame.grid(row=11, column=0, pady=5)
-        ctk.CTkButton(ur_frame, text="UNDO", width=70, font=self.font_main, command=self.undo, 
-                     border_width=2, border_color=self.color_border, fg_color="#fff", text_color="#000").pack(side="left", padx=5)
-        ctk.CTkButton(ur_frame, text="REDO", width=70, font=self.font_main, command=self.redo,
-                     border_width=2, border_color=self.color_border, fg_color="#fff", text_color="#000").pack(side="left", padx=5)
+        maze_frame = tk.Frame(self.root)
+        maze_frame.pack(fill="both", expand=True, padx=8, pady=6)
 
-        self.sidebar_frame.grid_rowconfigure(12, weight=1)
-
-        # File Operations
-        self.btn_new = ctk.CTkButton(
-            self.sidebar_frame, text="NEW MAZE", command=self.new_maze,
-            font=self.font_main, fg_color="white", text_color=self.color_text,
-            border_width=2, border_color=self.color_border, hover_color="#eeeeee", corner_radius=8
-        )
-        self.btn_new.grid(row=13, column=0, padx=20, pady=5)
-        
-        self.btn_save = ctk.CTkButton(
-            self.sidebar_frame, text="SAVE MAZE", command=self.save_maze_dialog,
-            font=self.font_main, fg_color="white", text_color=self.color_text,
-            border_width=2, border_color=self.color_border, hover_color="#eeeeee", corner_radius=8
-        )
-        self.btn_save.grid(row=14, column=0, padx=20, pady=5)
-        
-        self.btn_load = ctk.CTkButton(
-            self.sidebar_frame, text="LOAD MAZE", command=self.load_maze_dialog,
-            font=self.font_main, fg_color="white", text_color=self.color_text,
-            border_width=2, border_color=self.color_border, hover_color="#eeeeee", corner_radius=8
-        )
-        self.btn_load.grid(row=15, column=0, padx=20, pady=5)
-        
-        self.btn_export = ctk.CTkButton(
-            self.sidebar_frame, text="EXPORT ROUTE", command=self.export_route_dialog, 
-            font=self.font_main, fg_color="#ff9eb5", text_color="white",
-            border_width=2, border_color=self.color_border, hover_color="#e07790", corner_radius=8
-        )
-        self.btn_export.grid(row=16, column=0, padx=20, pady=5)
-        
-        self.btn_png = ctk.CTkButton(
-            self.sidebar_frame, text="SAVE AS PNG 📸", command=self.export_png_dialog, 
-            font=self.font_main, fg_color="#91d2ff", text_color="white",
-            border_width=2, border_color=self.color_border, hover_color="#7cbce8", corner_radius=8
-        )
-        self.btn_png.grid(row=17, column=0, padx=20, pady=(5, 20))
-
-        # Main Frame
-        self.main_frame = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
-        self.main_frame.grid(row=0, column=1, sticky="nsew", pady=10, padx=(0, 10))
-        self.main_frame.grid_rowconfigure(1, weight=1)
-        self.main_frame.grid_columnconfigure(0, weight=1)
-
-        # Top Bar (Cell Size + Grid Size)
-        self.top_bar = ctk.CTkFrame(
-            self.main_frame, height=50, corner_radius=10, 
-            fg_color="white", border_width=3, border_color=self.color_border
-        )
-        self.top_bar.grid(row=0, column=0, sticky="ew")
-        
-        # Dynamic Grid Inputs
-        ctk.CTkLabel(self.top_bar, text="R:", font=self.font_main, text_color=self.color_text).pack(side="left", padx=(10,2), pady=10)
-        self.rows_entry = ctk.CTkEntry(self.top_bar, width=40, font=self.font_main, border_width=2, border_color=self.color_border)
-        self.rows_entry.insert(0, str(self.maze.rows))
-        self.rows_entry.pack(side="left", padx=2, pady=10)
-        
-        ctk.CTkLabel(self.top_bar, text="C:", font=self.font_main, text_color=self.color_text).pack(side="left", padx=(5,2), pady=10)
-        self.cols_entry = ctk.CTkEntry(self.top_bar, width=40, font=self.font_main, border_width=2, border_color=self.color_border)
-        self.cols_entry.insert(0, str(self.maze.cols))
-        self.cols_entry.pack(side="left", padx=2, pady=10)
-        
-        ctk.CTkLabel(self.top_bar, text="SIZE(M):", font=self.font_main, text_color=self.color_text).pack(side="left", padx=(10,2), pady=10)
-        self.cell_size_entry = ctk.CTkEntry(self.top_bar, width=50, font=self.font_main, border_width=2, border_color=self.color_border)
-        self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
-        self.cell_size_entry.pack(side="left", padx=2, pady=10)
-        
-        ctk.CTkButton(
-            self.top_bar, text="APPLY GRID", command=self.apply_grid_settings, width=80,
-            font=self.font_main, fg_color=self.color_btn_green, text_color=self.color_text,
-            border_width=2, border_color=self.color_border, hover_color=self.color_btn_hover
-        ).pack(side="left", padx=10, pady=10)
-        
-        info_text = "Click internal edges for WALLS.\nClick inside cells for MARKERS."
-        ctk.CTkLabel(
-            self.top_bar, text=info_text, text_color=self.color_sidebar, 
-            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"), justify="right"
-        ).pack(side="right", padx=15)
-
-        # Canvas Setup
-        self.canvas_frame = ctk.CTkFrame(
-            self.main_frame, corner_radius=10, fg_color="white", 
-            border_width=3, border_color=self.color_border
-        )
-        self.canvas_frame.grid(row=1, column=0, sticky="nsew", pady=10)
-        
-        self.canvas_title = ctk.CTkLabel(
-            self.canvas_frame, text=" MAZE VIEW ", font=self.font_main, 
-            text_color="white", fg_color=self.color_sidebar, corner_radius=0
-        )
-        self.canvas_title.pack(fill="x", padx=3, pady=(3, 0))
-
-        self.canvas_bg = "#f4f8ff"
-        self.canvas = tk.Canvas(self.canvas_frame, bg=self.canvas_bg, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=3, pady=(0, 3))
+        self.canvas = tk.Canvas(maze_frame, bg="#f5f5f5", highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
         self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<Button-3>", self.on_right_click)
 
-        # Status Bar
-        self.status_label = ctk.CTkLabel(
-            self.main_frame, textvariable=self.status, anchor="w", 
-            font=self.font_main, text_color=self.color_text, 
-            fg_color=self.color_btn_yellow, corner_radius=10,
-            border_width=2, border_color=self.color_border, padx=15
-        )
-        self.status_label.grid(row=2, column=0, sticky="ew", pady=(0, 0))
+        self.canvas_scrollbar = tk.Scrollbar(maze_frame, orient="vertical", command=self.canvas.yview)
+        self.canvas_scrollbar.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=self.canvas_scrollbar.set)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
+        tk.Label(self.root, textvariable=self.status, anchor="w", relief="sunken", padx=8).pack(fill="x", side="bottom")
+        self._sync_motion_panel_visibility()
+
     def _resize_canvas(self):
-        w = 2 * self.PAD + self.maze.cols * self.CELL_PX
-        h = 2 * self.PAD + self.maze.rows * self.CELL_PX
-        self.canvas.config(width=w, height=h)
-        self.root.minsize(min(w + 20, 1300), min(h + 265, 1020))
+        full_w = 2 * self.PAD + self.maze.cols * self.CELL_PX
+        full_h = 2 * self.PAD + self.maze.rows * self.CELL_PX
+        viewport_w = min(full_w, 1200)
+        viewport_h = min(full_h, 640)
+        self.canvas.config(width=viewport_w, height=viewport_h, scrollregion=(0, 0, full_w, full_h))
+        self.root.minsize(min(viewport_w + 60, 1300), 620)
+
+    def _on_mousewheel(self, event):
+        if getattr(self, 'canvas', None) is None:
+            return
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+
+    def toggle_motion_panel(self):
+        self.motion_panel_visible.set(not self.motion_panel_visible.get())
+        self._sync_motion_panel_visibility()
+
+    def _sync_motion_panel_visibility(self):
+        if not hasattr(self, 'motion'):
+            return
+        if self.motion_panel_visible.get():
+            self.motion.pack(fill='x', padx=8, pady=(3, 2), after=self.root.winfo_children()[2])
+            self.motion_toggle_text.set('Hide Motion Profile')
+        else:
+            self.motion.pack_forget()
+            self.motion_toggle_text.set('Show Motion Profile')
 
     def marker_attr_names(self, mode: str) -> Tuple[Optional[str], Optional[str]]:
         mapping = {
@@ -1237,28 +1217,225 @@ class MazeDesignerApp:
         if self.mode_supports_marker(mode):
             cell_attr, pos_attr = self.marker_attr_names(mode)
             self.update_marker_entry_fields(getattr(self.maze, pos_attr), getattr(self.maze, cell_attr))
+        elif mode == "ERASE_MARKER":
+            self.marker_measure_text.set("Erase Marker: left-click a marker; right-click also erases markers")
         else:
             self.marker_measure_text.set("Select START/PICKUP/DROP/EXIT for fine placement")
         self.redraw()
-=======
-    def _resize_window(self):
-        w = 2 * self.PAD + self.maze.cols * self.CELL_PX + 340
-        h = 2 * self.PAD + self.maze.rows * self.CELL_PX + 220
-        self.root.geometry(f"{int(w)}x{int(h)}")
-        self.root.minsize(int(w), int(h))
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
+
+    def _motion_mode_changed(self):
+        mode = self.motion_mode_var.get().upper()
+        for child in self.manual_frame.winfo_children():
+            try:
+                child.configure(state=("normal" if mode == "MANUAL" else "disabled"))
+            except tk.TclError:
+                pass
+        for child in self.auto_frame.winfo_children():
+            try:
+                child.configure(state=("normal" if mode == "AUTO" else "disabled"))
+            except tk.TclError:
+                pass
+        self.guide_edges = []
+        self.route_plan = None
+
+    def _sync_motion_vars_from_maze(self):
+        self.motion_mode_var.set(self.maze.motion_mode)
+        self.forward_speed_var.set(f"{self.maze.forward_speed_mps:.2f}")
+        self.manual_slow_var.set(f"{self.maze.manual_slow_front_cm:.1f}")
+        self.manual_stop_var.set(f"{self.maze.manual_stop_front_cm:.1f}")
+        self.auto_reaction_var.set(f"{self.maze.auto_reaction_time_s:.2f}")
+        self.auto_decel_var.set(f"{self.maze.auto_brake_decel_mps2:.2f}")
+        self.auto_margin_var.set(f"{self.maze.auto_safety_margin_cm:.1f}")
+        self.auto_clearance_var.set(f"{self.maze.auto_clearance_cm:.1f}")
+        self.auto_ramp_var.set(f"{self.maze.auto_slow_ramp_time_s:.2f}")
+        self._motion_mode_changed()
+        try:
+            profile = calculate_motion_profile(self.maze)
+            self.motion_result_var.set(
+                f"{profile['mode']}: slow @ {profile['slow_front_cm']:.1f} cm | "
+                f"brake/stop @ {profile['stop_front_cm']:.1f} cm"
+            )
+        except Exception:
+            self.motion_result_var.set("Invalid motion settings")
+
+    def apply_motion_settings(self, show_errors: bool = True, record_history: bool = True) -> bool:
+        try:
+            values = {
+                "motion_mode": self.motion_mode_var.get().upper(),
+                "forward_speed_mps": float(self.forward_speed_var.get()),
+                "manual_slow_front_cm": float(self.manual_slow_var.get()),
+                "manual_stop_front_cm": float(self.manual_stop_var.get()),
+                "auto_reaction_time_s": float(self.auto_reaction_var.get()),
+                "auto_brake_decel_mps2": float(self.auto_decel_var.get()),
+                "auto_safety_margin_cm": float(self.auto_margin_var.get()),
+                "auto_clearance_cm": float(self.auto_clearance_var.get()),
+                "auto_slow_ramp_time_s": float(self.auto_ramp_var.get()),
+            }
+            # Validate using a temporary detached MazeData so invalid text never
+            # partially mutates the current design.
+            temp_data = self.maze.to_dict()
+            temp_motion = dict(temp_data.get("motion_settings") or {})
+            temp_motion.update({
+                "mode": values["motion_mode"],
+                "forward_speed_mps": values["forward_speed_mps"],
+                "manual_slow_front_cm": values["manual_slow_front_cm"],
+                "manual_stop_front_cm": values["manual_stop_front_cm"],
+                "auto_reaction_time_s": values["auto_reaction_time_s"],
+                "auto_brake_decel_mps2": values["auto_brake_decel_mps2"],
+                "auto_safety_margin_cm": values["auto_safety_margin_cm"],
+                "auto_clearance_cm": values["auto_clearance_cm"],
+                "auto_slow_ramp_time_s": values["auto_slow_ramp_time_s"],
+            })
+            temp_data["motion_settings"] = temp_motion
+            temp_maze = MazeData.from_dict(temp_data)
+            profile = calculate_motion_profile(temp_maze)
+        except (ValueError, TypeError) as exc:
+            self.motion_result_var.set("Invalid motion settings")
+            if show_errors:
+                messagebox.showerror("Invalid motion profile", str(exc))
+            return False
+
+        changed = any(getattr(self.maze, key) != value for key, value in values.items())
+        if changed and record_history:
+            self._push_undo()
+        for key, value in values.items():
+            setattr(self.maze, key, value)
+        self.maze.motion_mode = str(self.maze.motion_mode).upper()
+        self.motion_result_var.set(
+            f"{profile['mode']}: slow @ {profile['slow_front_cm']:.1f} cm | "
+            f"brake/stop @ {profile['stop_front_cm']:.1f} cm"
+        )
+        self.status.set(
+            f"Motion {profile['mode']}: v={profile['forward_speed_mps']:.2f} m/s, "
+            f"slow={profile['slow_front_cm']:.1f} cm, stop={profile['stop_front_cm']:.1f} cm"
+        )
+        self.guide_edges = []
+        self.route_plan = None
+        return True
+
+    # ------------------------------------------------------------------
+    # Edit history / marker deletion
+    # ------------------------------------------------------------------
+    def _snapshot_maze(self) -> dict:
+        # JSON round-trip gives a detached, mutation-safe plain-data snapshot.
+        return json.loads(json.dumps(self.maze.to_dict()))
+
+    def _push_undo(self) -> None:
+        self.undo_stack.append(self._snapshot_maze())
+        if len(self.undo_stack) > self.history_limit:
+            del self.undo_stack[0]
+        self.redo_stack.clear()
+
+    def _sync_ui_from_maze(self) -> None:
+        self.cell_size_entry.delete(0, tk.END)
+        self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
+        self.rows_entry.delete(0, tk.END)
+        self.rows_entry.insert(0, str(self.maze.rows))
+        self.cols_entry.delete(0, tk.END)
+        self.cols_entry.insert(0, str(self.maze.cols))
+        self._sync_motion_vars_from_maze()
+        self.route = []
+        self.guide_edges = []
+        self.route_plan = None
+        self._resize_canvas()
+        self.current_mode_changed_marker()
+        self.redraw()
+
+    def _restore_snapshot(self, snapshot: dict) -> None:
+        self.maze = MazeData.from_dict(snapshot)
+        self._sync_ui_from_maze()
+
+    def undo(self, event=None):
+        if not self.undo_stack:
+            self.status.set("Nothing to undo")
+            return "break"
+        self.redo_stack.append(self._snapshot_maze())
+        snapshot = self.undo_stack.pop()
+        self._restore_snapshot(snapshot)
+        self.status.set(f"Undo | {len(self.undo_stack)} earlier edit(s) available")
+        return "break"
+
+    def redo(self, event=None):
+        if not self.redo_stack:
+            self.status.set("Nothing to redo")
+            return "break"
+        self.undo_stack.append(self._snapshot_maze())
+        snapshot = self.redo_stack.pop()
+        self._restore_snapshot(snapshot)
+        self.status.set(f"Redo | {len(self.redo_stack)} later edit(s) available")
+        return "break"
+
+    def clear_marker(self, mode: str, record_history: bool = True) -> bool:
+        if not self.mode_supports_marker(mode):
+            return False
+        cell_attr, pos_attr = self.marker_attr_names(mode)
+        if getattr(self.maze, cell_attr) is None and getattr(self.maze, pos_attr) is None:
+            return False
+        if record_history:
+            self._push_undo()
+        setattr(self.maze, cell_attr, None)
+        setattr(self.maze, pos_attr, None)
+        self.route = []
+        self.guide_edges = []
+        self.route_plan = None
+        if self.mode.get() == mode:
+            self.update_marker_entry_fields(None)
+        self.redraw()
+        self.status.set(f"{self.marker_label(mode)} erased")
+        return True
+
+    def delete_selected_marker(self, event=None):
+        mode = self.mode.get()
+        if self.mode_supports_marker(mode):
+            self.clear_marker(mode, record_history=True)
+        return "break"
+
+    def _nearest_marker_mode_at_canvas(self, x: float, y: float, max_distance_px: float = 24.0) -> Optional[str]:
+        best_mode = None
+        best_d2 = max_distance_px * max_distance_px
+        for mode in ("START", "PICKUP", "DROP", "EXIT"):
+            cell_attr, pos_attr = self.marker_attr_names(mode)
+            cell = getattr(self.maze, cell_attr)
+            pos = getattr(self.maze, pos_attr)
+            if cell is None:
+                continue
+            if pos is None:
+                x0, y0, x1, y1 = self.cell_rect(cell)
+                mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            else:
+                mx, my = self.world_pos_m_to_canvas(pos)
+            d2 = (float(x) - mx) ** 2 + (float(y) - my) ** 2
+            if d2 <= best_d2:
+                best_d2 = d2
+                best_mode = mode
+        return best_mode
+
+    def erase_marker_at_canvas(self, x: float, y: float) -> bool:
+        marker_mode = self._nearest_marker_mode_at_canvas(x, y)
+        if marker_mode is None:
+            self.status.set("No marker under cursor")
+            return False
+        return self.clear_marker(marker_mode, record_history=True)
 
     def new_maze(self):
         if not messagebox.askyesno("New maze", "Clear the current maze?"):
             return
-        self.save_state()
-        self.maze = MazeData(rows=self.maze.rows, cols=self.maze.cols, cell_size_m=self.maze.cell_size_m)
+        self._push_undo()
+        old = self.maze
+        self.maze = MazeData(
+            rows=old.rows, cols=old.cols, cell_size_m=old.cell_size_m,
+            motion_mode=old.motion_mode, forward_speed_mps=old.forward_speed_mps,
+            manual_slow_front_cm=old.manual_slow_front_cm, manual_stop_front_cm=old.manual_stop_front_cm,
+            auto_reaction_time_s=old.auto_reaction_time_s, auto_brake_decel_mps2=old.auto_brake_decel_mps2,
+            auto_safety_margin_cm=old.auto_safety_margin_cm, auto_clearance_cm=old.auto_clearance_cm,
+            auto_slow_ramp_time_s=old.auto_slow_ramp_time_s,
+        )
+        self._sync_motion_vars_from_maze()
         self.current_file = None
         self.update_marker_entry_fields(None)
         self.clear_route()
         self.redraw()
 
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
     def apply_grid_size(self):
         try:
             new_rows = int(self.rows_entry.get())
@@ -1312,6 +1489,7 @@ class MazeDesignerApp:
                 self.cols_entry.insert(0, str(old_cols))
                 return False
 
+        self._push_undo()
         self.maze.rows = new_rows
         self.maze.cols = new_cols
         self.maze.walls = {self.maze.canonical_edge(a, b) for a, b in self.maze.walls if fits(a) and fits(b)}
@@ -1326,6 +1504,7 @@ class MazeDesignerApp:
         self.maze._sync_all_marker_pose_and_cells()
 
         self.route = []
+        self.guide_edges = []
         self.route_plan = None
         self._resize_canvas()
         self.redraw()
@@ -1336,69 +1515,36 @@ class MazeDesignerApp:
         return True
 
     def apply_cell_size(self):
-=======
-    def apply_grid_settings(self):
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
         try:
-            r = int(self.rows_entry.get())
-            c = int(self.cols_entry.get())
-            cs = float(self.cell_size_entry.get())
-            if not (2 <= r <= 40 and 2 <= c <= 40): raise ValueError
-            if not 0.05 <= cs <= 5.0: raise ValueError
+            value = float(self.cell_size_entry.get())
+            if not 0.05 <= value <= 5.0:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid input", "Rows/Cols 2-40. Cell size 0.05-5.0")
+            messagebox.showerror("Invalid cell size", "Enter a value between 0.05 and 5.0 metres")
             return
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
+        if abs(value - self.maze.cell_size_m) < 1e-12:
+            self.status.set(f"Cell size unchanged: {value:.3f} m")
+            return True
+        self._push_undo()
         self.maze.cell_size_m = value
         self.maze._sync_all_marker_pose_and_cells()
         self.current_mode_changed_marker()
         self.status.set(f"Cell size = {value:.3f} m")
+        self.guide_edges = []
         self.route_plan = None
         self.redraw()
-=======
-        
-        self.save_state()
-        self.maze.rows = r
-        self.maze.cols = c
-        self.maze.cell_size_m = cs
-        
-        # Cleanup out of bounds
-        out_of_bounds = [w for w in self.maze.walls if not (self.maze.in_bounds(w[0]) and self.maze.in_bounds(w[1]))]
-        for w in out_of_bounds: self.maze.walls.discard(w)
-        if self.maze.start and not self.maze.in_bounds(self.maze.start): self.maze.start = None
-        if self.maze.object_cell and not self.maze.in_bounds(self.maze.object_cell): self.maze.object_cell = None
-        if self.maze.drop_cell and not self.maze.in_bounds(self.maze.drop_cell): self.maze.drop_cell = None
-        if self.maze.goal and not self.maze.in_bounds(self.maze.goal): self.maze.goal = None
-        
-        self.route = []
-        self.route_plan = None
-        self.cancel_animation()
-        self._resize_window()
-        self.redraw()
-        self.status.set(f"Grid updated to {r}x{c}, Size: {cs}m")
-
-    def cancel_animation(self):
-        if self.anim_id:
-            self.root.after_cancel(self.anim_id)
-            self.anim_id = None
-        if hasattr(self, 'gif_anim_id') and self.gif_anim_id:
-            self.root.after_cancel(self.gif_anim_id)
-            self.gif_anim_id = None
-        if hasattr(self, 'gif_anim_id') and self.gif_anim_id:
-            self.root.after_cancel(self.gif_anim_id)
-            self.gif_anim_id = None
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
 
     def clear_route(self):
-        self.cancel_animation()
         self.route = []
+        self.guide_edges = []
         self.route_plan = None
         self.redraw()
 
     def rotate_start(self):
-        self.save_state()
+        self._push_undo()
         i = HEADINGS.index(self.maze.start_heading)
         self.maze.start_heading = HEADINGS[(i + 1) % 4]
+        self.guide_edges = []
         self.route_plan = None
         self.status.set(f"Start heading = {self.maze.start_heading}")
         self.redraw()
@@ -1465,8 +1611,10 @@ class MazeDesignerApp:
             return
         pos_m = self.maze.clamp_pos_m((x_m, y_m))
         cell = self.maze.pos_to_cell(pos_m)
+        self._push_undo()
         self.set_marker(mode, cell, pos_m)
         self.route = []
+        self.guide_edges = []
         self.route_plan = None
         self.redraw()
         self.status.set(self.describe_marker(mode))
@@ -1518,29 +1666,48 @@ class MazeDesignerApp:
             local_y_m = self.maze.cell_size_m - y_dist_m
 
         pos_m = self.maze.cell_local_to_world_m(cell, local_x_m, local_y_m)
+        self._push_undo()
         self.set_marker(mode, cell, pos_m)
         self.route = []
+        self.guide_edges = []
         self.route_plan = None
         self.redraw()
         self.status.set(self.describe_marker(mode))
 
     def on_click(self, event):
+        """Primary mouse action.
+
+        WALL mode intentionally behaves like a drawing program: left-click adds
+        a wall. ERASE keeps the old left-click erase workflow for compatibility.
+        Marker modes place/move the selected marker. ERASE_MARKER removes a
+        marker with left-click. Every edit participates in Ctrl+Z history.
+        """
         cell = self.event_to_cell(event.x, event.y)
         if cell is None:
             return
-        
-        self.save_state()
         mode = self.mode.get()
 
         if mode in ("WALL", "ERASE"):
             edge = self.nearest_internal_edge(cell, event.x, event.y)
             if edge is None:
-                self.history_undo.pop()
                 self.status.set("Click closer to an INTERNAL cell edge to edit a wall")
                 return
-            self.maze.set_wall_between(edge[0], edge[1], mode == "WALL")
-            self.status.set(f"{'Wall added' if mode == 'WALL' else 'Wall erased'}: {edge[0]} <-> {edge[1]}")
+            canonical = self.maze.canonical_edge(edge[0], edge[1])
+            want_present = mode == "WALL"
+            already_present = canonical in self.maze.walls
+            if already_present == want_present:
+                self.status.set("Wall already present" if want_present else "No wall on that edge")
+                return
+            self._push_undo()
+            self.maze.set_wall_between(edge[0], edge[1], want_present)
+            self.status.set(f"{'Wall added' if want_present else 'Wall erased'}: {edge[0]} <-> {edge[1]}")
+
+        elif mode == "ERASE_MARKER":
+            if not self.erase_marker_at_canvas(event.x, event.y):
+                return
+
         elif self.mode_supports_marker(mode):
+            self._push_undo()
             if self.fine_marker_mode.get():
                 pos_m = self.event_to_world_pos_m(event.x, event.y)
                 self.set_marker(mode, cell, pos_m)
@@ -1548,112 +1715,70 @@ class MazeDesignerApp:
                 self.set_marker(mode, cell, self.maze.cell_center_pos_m(cell))
             self.status.set(self.describe_marker(mode))
 
-        self.clear_route()
+        self.route = []
+        self.guide_edges = []
+        self.route_plan = None
+        self.redraw()
+
+    def on_right_click(self, event):
+        """Context erase: right-click wall to remove it, or right-click marker.
+
+        Wall hit-testing is tried first only when the click is close to an
+        INTERNAL edge *and that edge actually contains a wall*. Otherwise the
+        click is treated as a marker erase. This makes right-click safe in the
+        middle of a cell.
+        """
+        cell = self.event_to_cell(event.x, event.y)
+        if cell is None:
+            return "break"
+
+        edge = self.nearest_internal_edge(cell, event.x, event.y)
+        if edge is not None:
+            canonical = self.maze.canonical_edge(edge[0], edge[1])
+            if canonical in self.maze.walls:
+                self._push_undo()
+                self.maze.set_wall_between(edge[0], edge[1], False)
+                self.route = []
+                self.guide_edges = []
+                self.route_plan = None
+                self.redraw()
+                self.status.set(f"Wall erased (right-click): {edge[0]} <-> {edge[1]}")
+                return "break"
+
+        self.erase_marker_at_canvas(event.x, event.y)
+        return "break"
 
     def preview_route(self):
-        try:
-            r = int(self.rows_entry.get())
-            c = int(self.cols_entry.get())
-            cs = float(self.cell_size_entry.get())
-            self.maze.rows = r
-            self.maze.cols = c
-            self.maze.cell_size_m = cs
-        except: pass
-        
+        self.apply_cell_size()
+        if not self.apply_motion_settings(show_errors=True, record_history=True):
+            return
         try:
             plan = validate_and_plan(self.maze)
         except ValueError as exc:
             messagebox.showerror("Route error", str(exc))
             return
-            
         self.route_plan = plan
         self.route = [tuple(c) for c in plan["path"]]
+        self.guide_edges = topology_preview_edges(plan)
         warning = " | ".join(plan["warnings"])
+        mission = " -> ".join(["START"] + list(plan.get("mission_order") or []))
+        if plan["mission_mode"] == "MAPPING_ONLY":
+            mission = "START -> runtime DFS/topology exploration (no PICKUP required)"
+        elif plan["mission_mode"] == "START_WITH_OBJECT":
+            mission += "  [starts with object; no PICKUP required]"
         self.status.set(
-            f"Guide OK: {len(plan['topology_guide']['nodes'])} nodes, "
-            f"{plan['total_cells']} cells" + (f" | WARNING: {warning}" if warning else "")
+            f"Guide OK [{plan['mission_mode']}]: {mission} | "
+            f"{len(plan['topology_guide']['nodes'])} recognisable nodes, "
+            f"{plan['total_cells']} mission cells (distance hint only)" + (f" | WARNING: {warning}" if warning else "")
         )
         self.redraw()
-        
-        # Start Animation
-        self.cancel_animation()
-        self.anim_index = 0
-        self.animate_robot()
-
         if warning:
             messagebox.showwarning("Route warning", warning)
 
-    def animate_robot(self):
-        if self.anim_index >= len(self.route):
-            self.anim_id = None
-            return
-            
-        if self.anim_index == 0:
-            self.redraw()
-            if hasattr(self, 'robot_frames') and len(self.robot_frames) > 1:
-                self.update_gif_frame()
-            
-        cell = self.route[self.anim_index]
-        x0, y0, x1, y1 = self.cell_rect(cell)
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        
-        self.canvas.delete("robot")
-        if self.robot_image:
-            self.canvas.create_image(cx, cy, image=self.robot_image, tags="robot")
-        else:
-            rad = self.CELL_PX * 0.35
-            self.canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill="#ff9eb5", outline="#1f2a63", width=3, tags="robot")
-            self.canvas.create_oval(cx - rad/2, cy - rad/2, cx + rad/2, cy + rad/2, fill="#fff785", outline="", tags="robot")
-            
-        self.canvas.tag_raise("robot")
-        self.anim_index += 1
-        self.anim_id = self.root.after(300, self.animate_robot)
-
-    def export_png_dialog(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")],
-            title="Save as PNG",
-            initialfile="maze_screenshot.png"
-        )
-        if not path:
-            return
-        
-        try:
-            if HAS_PIL and hasattr(ImageGrab, "grab"):
-                self.root.update_idletasks()
-                x = self.canvas.winfo_rootx()
-                y = self.canvas.winfo_rooty()
-                w = self.canvas.winfo_width()
-                h = self.canvas.winfo_height()
-                img = ImageGrab.grab(bbox=(x, y, x+w, y+h))
-                img.save(path)
-                self.status.set(f"Saved PNG to {os.path.basename(path)}")
-                messagebox.showinfo("Success", f"Saved PNG to:\n{path}")
-            else:
-                self.status.set("Error: PIL.ImageGrab not available.")
-        except Exception as e:
-            self.status.set(f"Save PNG failed: {e}")
-
-    def get_reachable_cells(self):
-        reachable = set()
-        start = self.maze.start if self.maze.start else (0, 0)
-        if not self.maze.in_bounds(start): return reachable
-        
-        queue = [start]
-        visited = {start}
-        
-        while queue:
-            curr = queue.pop(0)
-            reachable.add(curr)
-            for nr, nc in self.maze.neighbors(curr):
-                if not self.maze.has_wall_between(curr, (nr, nc)):
-                    if (nr, nc) not in visited:
-                        visited.add((nr, nc))
-                        queue.append((nr, nc))
-        return reachable
-
     def save_maze_dialog(self):
+        self.apply_cell_size()
+        if not self.apply_motion_settings(show_errors=True, record_history=True):
+            return
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("Maze JSON", "*.json"), ("All files", "*.*")],
@@ -1670,34 +1795,32 @@ class MazeDesignerApp:
         if not path:
             return
         try:
-            self.save_state()
-            self.maze = load_maze(path)
+            loaded_maze = load_maze(path)
         except Exception as exc:
             messagebox.showerror("Load error", str(exc))
             return
+        self._push_undo()
+        self.maze = loaded_maze
         self.current_file = path
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
         self.cell_size_entry.delete(0, tk.END)
         self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
         self.rows_entry.delete(0, tk.END)
         self.rows_entry.insert(0, str(self.maze.rows))
         self.cols_entry.delete(0, tk.END)
         self.cols_entry.insert(0, str(self.maze.cols))
+        self._sync_motion_vars_from_maze()
         self.current_mode_changed_marker()
         self.route = []
+        self.guide_edges = []
         self.route_plan = None
         self._resize_canvas()
         self.redraw()
-=======
-        self.rows_entry.delete(0, tk.END); self.rows_entry.insert(0, str(self.maze.rows))
-        self.cols_entry.delete(0, tk.END); self.cols_entry.insert(0, str(self.maze.cols))
-        self.cell_size_entry.delete(0, tk.END); self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
-        self.clear_route()
-        self._resize_window()
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
         self.status.set(f"Loaded maze: {path}")
 
     def export_route_dialog(self):
+        self.apply_cell_size()
+        if not self.apply_motion_settings(show_errors=True, record_history=True):
+            return
         try:
             plan = validate_and_plan(self.maze)
         except ValueError as exc:
@@ -1713,54 +1836,53 @@ class MazeDesignerApp:
         save_plan(path, plan)
         self.route_plan = plan
         self.route = [tuple(c) for c in plan["path"]]
+        self.guide_edges = topology_preview_edges(plan)
         self.redraw()
-        self.status.set(f"Exported robot route: {path}")
+        self.status.set(f"Exported robot route [{plan['mission_mode']}]: {path}")
 
     def redraw(self):
         c = self.canvas
         c.delete("all")
 
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
-=======
-        route_color = "#ff7eac"
-        route_glow = "#ffdbe7"
-        cell_fill = "#ffffff"
-        cell_outline = "#c7d7f7"
-        text_color = "#99b6ea"
-        wall_color = "#1f2a63"
-        border_color = "#1f2a63"
-        
-        # Route preview first, under grid walls.
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
+        # Preview the complete topology guide even when there is no mission
+        # target. This is the key behaviour for START-only / no-PICKUP maps.
+        for a, b in self.guide_edges:
+            ax0, ay0, ax1, ay1 = self.cell_rect(a)
+            bx0, by0, bx1, by1 = self.cell_rect(b)
+            c.create_line(
+                (ax0 + ax1) / 2, (ay0 + ay1) / 2,
+                (bx0 + bx1) / 2, (by0 + by1) / 2,
+                width=3, fill="#a6a6a6", dash=(7, 5),
+                capstyle=tk.ROUND, joinstyle=tk.ROUND,
+            )
+
+        # Mission path, when present, is drawn thicker on top of the soft guide.
         if len(self.route) >= 2:
             pts = []
             for cell in self.route:
                 x0, y0, x1, y1 = self.cell_rect(cell)
                 pts.extend(((x0 + x1) / 2, (y0 + y1) / 2))
-            c.create_line(*pts, width=12, fill=route_glow, smooth=False, capstyle=tk.ROUND, joinstyle=tk.ROUND)
-
-        reachable = self.get_reachable_cells()
+            c.create_line(*pts, width=6, fill="#6a5acd", smooth=False, capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
         for r in range(self.maze.rows):
             for col in range(self.maze.cols):
                 cell = (r, col)
                 x0, y0, x1, y1 = self.cell_rect(cell)
-                fill_color = cell_fill if cell in reachable else "#dee7f7"
-                c.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline=cell_outline, width=2)
-                c.create_text(x0 + 6, y0 + 6, text=f"{r},{col}", anchor="nw", fill=text_color, font=("Courier New", 8, "bold"))
+                c.create_rectangle(x0, y0, x1, y1, fill="#ffffff", outline="#dedede")
+                c.create_text(x0 + 5, y0 + 5, text=f"{r},{col}", anchor="nw", fill="#aaaaaa", font=("Arial", 7))
 
         if len(self.route) >= 2:
             pts = []
             for cell in self.route:
                 x0, y0, x1, y1 = self.cell_rect(cell)
                 pts.extend(((x0 + x1) / 2, (y0 + y1) / 2))
-            c.create_line(*pts, width=6, fill=route_color, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            c.create_line(*pts, width=5, fill="#6a5acd", capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
         left = self.PAD
         top = self.PAD
         right = self.PAD + self.maze.cols * self.CELL_PX
         bottom = self.PAD + self.maze.rows * self.CELL_PX
-        c.create_rectangle(left, top, right, bottom, width=4, outline=border_color)
+        c.create_rectangle(left, top, right, bottom, width=4, outline="#111111")
 
         for a, b in self.maze.walls:
             ar, ac = a
@@ -1768,18 +1890,12 @@ class MazeDesignerApp:
             ax0, ay0, ax1, ay1 = self.cell_rect(a)
             if ar == br:
                 x = ax1 if bc > ac else ax0
-                c.create_line(x, ay0, x, ay1, width=6, fill=wall_color)
+                c.create_line(x, ay0, x, ay1, width=5, fill="#111111")
             else:
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
                 y = ay0 if br > ar else ay1
                 c.create_line(ax0, y, ax1, y, width=5, fill="#111111")
-=======
-                y = ay1 if br > ar else ay0
-                c.create_line(ax0, y, ax1, y, width=6, fill=wall_color)
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
 
         if self.maze.start is not None:
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
             self._draw_marker(self.maze.start, self.maze.start_pos_m, "S", "#2e8b57")
             self._draw_heading_arrow_from_pos(self.maze.start_pos_m or self.maze.cell_center_pos_m(self.maze.start), self.maze.start_heading)
         if self.maze.object_cell is not None:
@@ -1788,15 +1904,6 @@ class MazeDesignerApp:
             self._draw_marker(self.maze.drop_cell, self.maze.drop_pos_m, "D", "#1e90ff")
         if self.maze.goal is not None:
             self._draw_marker(self.maze.goal, self.maze.goal_pos_m, "E", "#b22222")
-=======
-            self._draw_marker(self.maze.start, "S", self.color_btn_green)
-        if self.maze.object_cell is not None:
-            self._draw_marker(self.maze.object_cell, "P", "#ffb459")
-        if self.maze.drop_cell is not None:
-            self._draw_marker(self.maze.drop_cell, "D", "#7ea8f8")
-        if self.maze.goal is not None:
-            self._draw_marker(self.maze.goal, "E", "#ff9eb5")
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
 
         # Show exact wall clearances for the currently selected marker, similar
         # to a dimension drawing. This makes placements such as LEFT 40 cm +
@@ -1812,7 +1919,6 @@ class MazeDesignerApp:
     def _draw_marker_measurements(self, cell: Cell, pos_m: PosM):
         cx, cy = self.world_pos_m_to_canvas(pos_m)
         x0, y0, x1, y1 = self.cell_rect(cell)
-<<<<<<< HEAD:New Method with map as guidance/maze_designer.py
         clear = self.maze.wall_clearances_m(cell, pos_m)
         color = "#2f6fa7"
 
@@ -1857,14 +1963,6 @@ class MazeDesignerApp:
         ex = cx + dc * length
         ey = cy - dr * length
         self.canvas.create_line(cx, cy, ex, ey, width=4, fill="#006400", arrow=tk.LAST, arrowshape=(10, 12, 5))
-=======
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        rad = self.CELL_PX * 0.32
-        
-        self.canvas.create_oval(cx - rad + 3, cy - rad + 3, cx + rad + 3, cy + rad + 3, fill=self.color_border, outline="")
-        self.canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill=color, outline=self.color_border, width=2)
-        self.canvas.create_text(cx, cy, text=text, fill=self.color_text, font=("Courier New", 14, "bold"))
->>>>>>> 97ceda0c16bf1f5dadb409a7b68917b55ddb9f33:New Method with map as guidance/maze_designer_tool/maze_designer.py
 
 
 def cli_plan(maze_path: str, output: Optional[str]) -> int:
@@ -1889,7 +1987,7 @@ def main() -> int:
     if args.plan:
         return cli_plan(args.plan, args.out)
 
-    root = ctk.CTk()
+    root = tk.Tk()
     MazeDesignerApp(root, rows=max(2, args.rows), cols=max(2, args.cols), cell_size_m=args.cell_size)
     root.mainloop()
     return 0
