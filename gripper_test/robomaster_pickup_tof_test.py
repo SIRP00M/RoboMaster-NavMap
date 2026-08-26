@@ -7,13 +7,14 @@ This standalone test does NOT contain the maze solver. It combines:
     - Manual keyboard control that can take over at any time.
 
 Sequence
-    1. Reset: move arm to HOME, close gripper, then move to PICK position.
-    2. Wait for a valid ToF target and approach it.
-    3. Stop at PICKUP_TARGET_CM, open gripper, then close it.
-    4. Measure the object at PICK position (D1).
-    5. Lift the arm and verify that the object leaves the ToF beam (D2).
-    6. Lower the arm and verify that the object returns to the ToF beam (D3).
-    7. Success: lift again and enter MANUAL mode while holding the object.
+    1. Reset in LIFT/CARRY (0, 100), close, and wait for fresh clear ToF.
+    2. Approach with the arm lifted, smooth speed, and yaw hold.
+    3. Stop at PICKUP_TARGET_CM and remember the pre-pick ToF distance.
+    4. Open, lower to PICK/LOWEST (180, -50), and close around the object.
+       ToF is deliberately ignored while the arm is moving/down because the
+       arm can physically occlude the sensor.
+    5. Lift to CARRY and verify that the close object leaves the ToF beam.
+    6. Success: remain in CARRY, then enter MANUAL while holding.
        Failure: open, back away, and automatically retry from Reset.
 
 Mode switching
@@ -27,9 +28,9 @@ Manual keys
     A/D       strafe left/right (hold)
     Q/E       rotate left/right (hold)
     SPACE     emergency stop
-    1/2/3     HOME / PICK / LIFT arm positions
+    1/2/3     HOME / PICK-LOWEST / LIFT-CARRY arm positions
     O/P       open / close gripper
-    R         reset arm: HOME -> close -> PICK
+    R         reset arm: PICK-LOWEST -> close
     M         return to AUTO
     H         print keyboard help
     ESC       stop and exit
@@ -43,6 +44,7 @@ Safety rules
     - MANUAL blocks forward motion without ToF unless SHIFT+W is held.
     - A ToF NO_RETURN result is accepted during lift only when callbacks are
       still arriving. A stale sensor is never treated as pickup success.
+    - Arm actions have a hard timeout and are polled in short intervals.
     - Press Ctrl+C at any time to stop the chassis and disconnect safely.
 
 Requires:
@@ -57,7 +59,7 @@ import threading
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Set, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 try:
     from robomaster import robot
@@ -82,15 +84,18 @@ except ImportError as exc:
 CONNECTION = "ap"
 ENABLE_MOTION = True
 START_MODE = "AUTO"  # AUTO or MANUAL
+PROGRAM_VERSION = "AUTO_PICKUP_TOF_V4_FIXED"
 
-# Arm coordinates confirmed by the supplied arm test.
+# Arm coordinates confirmed on the user's physical robot.
+# HOME is retained only as an optional manual reference position (key 1).
 HOME_POSITION = (0, 0)
-PICK_POSITION = (0, 50)
-LIFT_POSITION = (0, 120)
+PICK_POSITION = (180, -50)
+LIFT_POSITION = (0, 100)
+RESET_POSITION = LIFT_POSITION
 
 # ToF target distance measured from the ToF lens, not from the gripper jaw.
 # If 4 cm is not the physical pickup point on your robot, calibrate this value.
-PICKUP_TARGET_CM = 4.0
+PICKUP_TARGET_CM = 8.0
 PICKUP_STOP_TOLERANCE_CM = 0.7
 
 # The robot waits safely instead of driving toward a very distant wall.
@@ -107,6 +112,17 @@ APPROACH_TIMEOUT_SEC = 25.0
 DRIVE_COMMAND_TIMEOUT_SEC = 0.20
 CONTROL_LOOP_SEC = 0.05
 
+# Smooth approach and heading hold. Heading correction is applied ONLY while
+# translating forward; it never rotates the chassis while waiting/idle.
+APPROACH_ACCEL_MPS2 = 0.18
+APPROACH_HEADING_HOLD = True
+APPROACH_HEADING_KP = 1.0
+APPROACH_HEADING_DEADBAND_DEG = 2.0
+APPROACH_HEADING_MAX_Z_DPS = 8.0
+# From the supplied field log: z > 0 makes attitude yaw decrease.
+APPROACH_DRIVE_TO_YAW_SIGN = -1
+ATTITUDE_FREQUENCY_HZ = 20
+
 # ToF configuration.
 TOF_FREQUENCY_HZ = 20
 TOF_FILTER_SIZE = 5
@@ -116,26 +132,40 @@ TOF_STALE_SEC = 0.60
 TOF_STARTUP_TIMEOUT_SEC = 5.0
 TOF_LOST_ABORT_SEC = 2.0
 TOF_PRINT_INTERVAL_SEC = 0.25
+TOF_CLEAR_AFTER_LIFT_TIMEOUT_SEC = 2.5
+TOF_CLEAR_REQUIRED_SAMPLES = 3
 
 # Mechanical settling times.
 ARM_SETTLE_SEC = 0.35
 GRIPPER_OPEN_SEC = 1.5
 GRIPPER_CLOSE_SEC = 1.5
+GRIPPER_OPEN_POWER = 50   # output power, not opening percentage
+GRIPPER_CLOSE_POWER = 50  # output power / holding force
+# Stop driving the gripper motor against its mechanical end-stop. During the
+# empty reset there is nothing to hold, so pausing reduces idle vibration.
+GRIPPER_PAUSE_AFTER_OPEN = True
+GRIPPER_HOLD_DURING_EMPTY_RESET = False
+
+# Never wait indefinitely for an SDK action. wait_for_completed() is polled in
+# short slices so Ctrl+C and ESC can be handled promptly.
+ARM_ACTION_TIMEOUT_SEC = 8.0
+ACTION_WAIT_SLICE_SEC = 0.10
+CLEANUP_CALL_TIMEOUT_SEC = 2.0
 
 # Verification uses only fresh callbacks collected after each arm movement.
 VERIFY_WINDOW_SEC = 0.80
 VERIFY_MIN_VALID_SAMPLES = 4
 VERIFY_MIN_CALLBACKS = 5
 
-# D1 must still be close after the gripper closes.
-GRABBED_OBJECT_MAX_CM = 10.0
-
-# D2 must be clearly farther than D1, or most fresh callbacks must report
+# Lifted ToF must be clearly farther than the pre-pick distance, or most fresh
+# callbacks must report
 # NO_RETURN while the callback remains alive.
 LIFT_CLEAR_DELTA_CM = 8.0
 NO_RETURN_SUCCESS_RATIO = 0.60
 
-# D3 should return close to D1 after lowering the held object.
+# Disabled because this robot's arm/gripper itself blocks ToF at PICK/LOWEST.
+# A low-pose D1/D3 reading therefore cannot distinguish the object from the arm.
+ENABLE_LOWER_RETURN_VERIFICATION = False
 RETURN_OBJECT_MAX_CM = 10.0
 RETURN_MATCH_TOLERANCE_CM = 5.0
 
@@ -155,9 +185,9 @@ AUTO_SUCCESS_ENTERS_MANUAL = True
 AUTO_FAILURE_ENTERS_MANUAL = True
 
 # Manual chassis settings.
-MANUAL_FORWARD_SPEED = 0.08       # m/s
-MANUAL_STRAFE_SPEED = 0.08        # m/s
-MANUAL_TURN_SPEED = 20.0          # deg/s
+MANUAL_FORWARD_SPEED = 0.40     # m/s
+MANUAL_STRAFE_SPEED = 0.40        # m/s
+MANUAL_TURN_SPEED = 500.0          # deg/s
 MANUAL_Y_SIGN = 1                 # set -1 if A/D are reversed on your robot
 MANUAL_Z_SIGN = 1                 # set -1 if Q/E are reversed on your robot
 MANUAL_FRONT_STOP_CM = 3.5
@@ -306,6 +336,42 @@ def check_auto_keyboard(controls: KeyboardControls) -> None:
 
 
 # ============================================================
+# Attitude / straight-line heading support
+# ============================================================
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def normalize_angle_deg(angle: float) -> float:
+    return (float(angle) + 180.0) % 360.0 - 180.0
+
+
+def shortest_angle_error_deg(target: float, current: float) -> float:
+    return normalize_angle_deg(float(target) - float(current))
+
+
+class AttitudeTracker:
+    """Thread-safe yaw storage used only while AUTO is moving forward."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._yaw: Optional[float] = None
+
+    def callback(self, yaw, pitch, roll) -> None:
+        try:
+            value = normalize_angle_deg(float(yaw))
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            self._yaw = value
+
+    def yaw(self) -> Optional[float]:
+        with self._lock:
+            return self._yaw
+
+
+# ============================================================
 # ToF reader
 # ============================================================
 
@@ -342,6 +408,7 @@ class ToFReader:
 
     def __init__(self):
         self._lock = threading.Lock()
+        self.paused = False # Added for FIX 3 (ToF Pause)
         self._sequence = 0
         self._last_status = "STARTING"
         self._last_distance_cm: Optional[float] = None
@@ -352,6 +419,9 @@ class ToFReader:
         )
 
     def callback(self, data):
+        if self.paused: # Added for FIX 3 (ToF Pause)
+            return
+
         now = time.monotonic()
         status = "BAD_PACKET"
         distance_cm: Optional[float] = None
@@ -422,6 +492,15 @@ class ToFReader:
             time.sleep(0.02)
         return False
 
+    def clear_measurement_history(self) -> None:
+        """Discard readings produced while the arm was occluding the ToF."""
+        with self._lock:
+            self._last_status = "ARM_SETTLING"
+            self._last_distance_cm = None
+            self._last_raw_mm = None
+            self._last_callback_time = None
+            self._recent_valid.clear()
+
     def collect_fresh_observation(self, duration_sec: float) -> ToFObservation:
         """Collect only callback events produced after this function starts."""
         started = time.monotonic()
@@ -454,56 +533,193 @@ class ToFReader:
 # Hardware actions
 # ============================================================
 
-def stop_chassis(chassis) -> None:
+_CHASSIS_STATE_LOCK = threading.Lock()
+_CHASSIS_MOVING: Dict[int, bool] = {}
+
+
+def drive_chassis(chassis, x: float, y: float, z: float) -> None:
+    """Send one motion command and remember that an explicit stop is needed."""
     if chassis is None or not ENABLE_MOTION:
         return
+    if abs(x) < 1e-9 and abs(y) < 1e-9 and abs(z) < 1e-9:
+        stop_chassis(chassis)
+        return
+    chassis.drive_speed(
+        x=x,
+        y=y,
+        z=z,
+        timeout=DRIVE_COMMAND_TIMEOUT_SEC,
+    )
+    with _CHASSIS_STATE_LOCK:
+        _CHASSIS_MOVING[id(chassis)] = True
+
+
+def stop_chassis(chassis, force: bool = False) -> None:
+    """Stop once; avoid refreshing zero-speed commands every control cycle.
+
+    The old WAIT OBJECT loop sent drive_speed(0, 0, 0) every 50 ms.  On the
+    physical robot this can keep the wheel controller active and cause a slow
+    twitch/rotation while the robot should be idle.
+    """
+    if chassis is None or not ENABLE_MOTION:
+        return
+    chassis_id = id(chassis)
+    with _CHASSIS_STATE_LOCK:
+        already_stopped = not _CHASSIS_MOVING.get(chassis_id, True)
+    if already_stopped and not force:
+        return
     try:
-        chassis.drive_speed(x=0.0, y=0.0, z=0.0, timeout=0.2)
+        # Added for FIX 1: Use drive_wheels for hard-stop instead of drive_speed(0,0,0)
+        chassis.drive_wheels(w1=0, w2=0, w3=0, w4=0)
     except Exception:
         pass
+    finally:
+        with _CHASSIS_STATE_LOCK:
+            _CHASSIS_MOVING[chassis_id] = False
 
 
-def move_arm(arm, position: Tuple[int, int], label: str) -> None:
+def run_cleanup_with_timeout(
+    label: str,
+    function: Callable[[], object],
+    timeout_sec: float = CLEANUP_CALL_TIMEOUT_SEC,
+) -> bool:
+    """Run SDK cleanup in a daemon thread so shutdown cannot hang forever."""
+    completed = threading.Event()
+    errors: List[BaseException] = []
+
+    def worker() -> None:
+        try:
+            function()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=worker, daemon=True, name=f"cleanup-{label}")
+    thread.start()
+    completed.wait(timeout=max(0.1, timeout_sec))
+
+    if not completed.is_set():
+        print(f"[SHUTDOWN WARNING] {label} timed out; continuing shutdown")
+        return False
+    elif errors:
+        print(f"[SHUTDOWN WARNING] {label} failed: {errors[0]}")
+        return False
+    return True
+
+
+def wait_for_action_safely(
+    action,
+    timeout_sec: float,
+    label: str,
+    controls: Optional[KeyboardControls] = None,
+) -> None:
+    """Poll an SDK action with a hard deadline instead of blocking forever."""
+    deadline = time.monotonic() + max(ACTION_WAIT_SLICE_SEC, timeout_sec)
+
+    while True:
+        if controls is not None and controls.exit_requested():
+            raise ProgramExitRequested
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            raise TimeoutError(
+                f"{label} timed out after {timeout_sec:.1f} seconds"
+            )
+
+        wait_slice = min(ACTION_WAIT_SLICE_SEC, remaining)
+        # RoboMaster SDK returns True on completion and False on timeout.
+        if action.wait_for_completed(timeout=wait_slice):
+            return
+
+
+def move_arm(
+    arm,
+    position: Tuple[int, int],
+    label: str,
+    controls: Optional[KeyboardControls] = None,
+) -> None:
     x, y = position
     print(f"[ARM] {label}: x={x}, y={y}")
     action = arm.moveto(x=x, y=y)
-    action.wait_for_completed()
+    wait_for_action_safely(
+        action,
+        timeout_sec=ARM_ACTION_TIMEOUT_SEC,
+        label=f"Arm action '{label}' (x={x}, y={y})",
+        controls=controls,
+    )
+    print(f"[ARM] {label}: completed")
     time.sleep(ARM_SETTLE_SEC)
 
 
 def open_gripper(gripper, label: str = "OPEN") -> None:
-    print(f"[GRIPPER] {label}")
-    gripper.open()
+    print(f"[GRIPPER] {label} power={GRIPPER_OPEN_POWER}%")
+    result = gripper.open(power=GRIPPER_OPEN_POWER)
+    if result is False:
+        raise RuntimeError("gripper.open() returned False")
     time.sleep(GRIPPER_OPEN_SEC)
+    if GRIPPER_PAUSE_AFTER_OPEN:
+        result = gripper.pause()
+        if result is False:
+            raise RuntimeError("gripper.pause() returned False after open")
 
 
-def close_gripper(gripper, label: str = "CLOSE") -> None:
-    print(f"[GRIPPER] {label}")
-    gripper.close()
+def close_gripper(
+    gripper,
+    label: str = "CLOSE",
+    hold: bool = True,
+) -> None:
+    print(f"[GRIPPER] {label} power={GRIPPER_CLOSE_POWER}%")
+    result = gripper.close(power=GRIPPER_CLOSE_POWER)
+    if result is False:
+        raise RuntimeError("gripper.close() returned False")
     time.sleep(GRIPPER_CLOSE_SEC)
+    if not hold:
+        result = gripper.pause()
+        if result is False:
+            raise RuntimeError("gripper.pause() returned False after close")
 
 
-def reset_pickup_arm(arm, gripper) -> None:
-    """Reset requested by the user: arm down, close, then use PICK height."""
-    print("\n[RESET] Move down and close gripper")
-    move_arm(arm, HOME_POSITION, "HOME / LOWEST")
-    close_gripper(gripper, "RESET CLOSE")
-    move_arm(arm, PICK_POSITION, "PICK POSITION")
+def reset_pickup_arm(
+    arm,
+    gripper,
+    controls: Optional[KeyboardControls] = None,
+    tof: Optional[ToFReader] = None,
+) -> None:
+    """Reset in CARRY so the arm cannot occlude ToF during detection."""
+    print("\n[RESET] Move to LIFT/CARRY and close gripper")
+    move_arm(arm, RESET_POSITION, "RESET / LIFT / CARRY", controls)
+    close_gripper(
+        gripper,
+        "RESET CLOSE",
+        hold=GRIPPER_HOLD_DURING_EMPTY_RESET,
+    )
+    if tof is not None:
+        tof.clear_measurement_history()
 
 
-def back_away(chassis) -> None:
+def back_away(
+    chassis,
+    controls: Optional[KeyboardControls] = None,
+) -> None:
     if not ENABLE_MOTION or BACKOFF_AFTER_FAILURE_M <= 0.0:
         return
+    if BACKOFF_SPEED_MPS <= 0.0:
+        raise ValueError("BACKOFF_SPEED_MPS must be greater than zero")
+
     stop_chassis(chassis)
     print(f"[RECOVERY] Back away {BACKOFF_AFTER_FAILURE_M * 100:.1f} cm")
-    action = chassis.move(
-        x=-BACKOFF_AFTER_FAILURE_M,
-        y=0.0,
-        z=0.0,
-        xy_speed=BACKOFF_SPEED_MPS,
-    )
-    action.wait_for_completed()
-    stop_chassis(chassis)
+    duration_sec = BACKOFF_AFTER_FAILURE_M / BACKOFF_SPEED_MPS
+    deadline = time.monotonic() + duration_sec
+
+    try:
+        while time.monotonic() < deadline:
+            if controls is not None:
+                check_auto_keyboard(controls)
+            drive_chassis(chassis, x=-BACKOFF_SPEED_MPS, y=0.0, z=0.0)
+            time.sleep(CONTROL_LOOP_SEC)
+    finally:
+        stop_chassis(chassis)
 
 
 # ============================================================
@@ -518,16 +734,65 @@ def approach_speed(distance_cm: float) -> float:
     return APPROACH_CRAWL_SPEED
 
 
+def slew_toward(current: float, target: float, max_delta: float) -> float:
+    if current < target:
+        return min(target, current + max_delta)
+    return max(target, current - max_delta)
+
+
 def format_raw_mm(raw_mm: Optional[float]) -> str:
     return "---" if raw_mm is None else f"{raw_mm:.0f}"
+
+
+def wait_for_tof_clear_after_lift(
+    tof: ToFReader,
+    controls: KeyboardControls,
+) -> bool:
+    """Wait only for evidence that the lifted arm no longer blocks ToF."""
+    print("[TOF] Waiting for fresh beam after LIFT/CARRY...")
+    deadline = time.monotonic() + TOF_CLEAR_AFTER_LIFT_TIMEOUT_SEC
+    last_sequence = tof.latest_event().sequence
+    clear_samples = 0
+    last_print = 0.0
+
+    while time.monotonic() < deadline:
+        check_auto_keyboard(controls)
+        event = tof.latest_event()
+        if event.sequence != last_sequence:
+            last_sequence = event.sequence
+            if event.status in ("VALID", "NO_RETURN"):
+                clear_samples += 1
+                if clear_samples >= TOF_CLEAR_REQUIRED_SAMPLES:
+                    print(f"[TOF] Beam clear after lift ({event.status})")
+                    return True
+            else:
+                clear_samples = 0
+
+        now = time.monotonic()
+        if now - last_print >= TOF_PRINT_INTERVAL_SEC:
+            print(
+                f"[TOF ARM CLEAR] status={event.status} "
+                f"raw={format_raw_mm(event.raw_mm)} mm"
+            )
+            last_print = now
+        time.sleep(CONTROL_LOOP_SEC)
+
+    event = tof.latest_event()
+    print(
+        "[TOF BLOCKED] Arm is already at LIFT/CARRY but the beam did not "
+        f"clear: status={event.status}, raw={format_raw_mm(event.raw_mm)} mm"
+    )
+    print("[TOF BLOCKED] Check arm calibration or move the ToF above the arm path")
+    return False
 
 
 def approach_object(
     chassis,
     tof: ToFReader,
     controls: KeyboardControls,
+    attitude: AttitudeTracker,
 ) -> Optional[float]:
-    """Approach until a stable ToF reading reaches PICKUP_TARGET_CM."""
+    """Smoothly approach with yaw hold until ToF reaches the target."""
     print(
         f"[APPROACH] Waiting for object within {OBJECT_DETECT_MAX_CM:.1f} cm; "
         f"target={PICKUP_TARGET_CM:.1f} cm"
@@ -536,6 +801,10 @@ def approach_object(
     approach_started: Optional[float] = None
     lost_since: Optional[float] = None
     last_print = 0.0
+    last_control = time.monotonic()
+    current_speed = 0.0
+    target_yaw: Optional[float] = None
+    min_seen_cm: float = 999.0 # Added for FIX 2: ToF Slip Guard
 
     while True:
         check_auto_keyboard(controls)
@@ -544,6 +813,7 @@ def approach_object(
 
         if status != "VALID" or distance_cm is None:
             stop_chassis(chassis)
+            current_speed = 0.0
 
             if lost_since is None:
                 lost_since = now
@@ -570,6 +840,7 @@ def approach_object(
 
         if distance_cm > OBJECT_DETECT_MAX_CM:
             stop_chassis(chassis)
+            current_speed = 0.0
             if now - last_print >= TOF_PRINT_INTERVAL_SEC:
                 print(
                     f"[WAIT OBJECT] {distance_cm:.1f} cm is beyond the configured "
@@ -581,7 +852,19 @@ def approach_object(
 
         if approach_started is None:
             approach_started = now
+            target_yaw = attitude.yaw()
+            min_seen_cm = distance_cm # Added for FIX 2
             print(f"[OBJECT DETECTED] {distance_cm:.1f} cm")
+            if target_yaw is not None:
+                print(f"[HEADING HOLD] target yaw={target_yaw:+.1f} deg")
+        else:
+            # Added for FIX 2: Slip Guard (Abort if beam slips past object)
+            if distance_cm > min_seen_cm + 10.0:
+                stop_chassis(chassis)
+                print(f"[APPROACH FAILED] ลำแสง ToF หลุดจากวัตถุ! (ระยะกระโดดจาก {min_seen_cm:.1f} เป็น {distance_cm:.1f} cm)")
+                return None
+            if distance_cm < min_seen_cm:
+                min_seen_cm = distance_cm
 
         if now - approach_started > APPROACH_TIMEOUT_SEC:
             stop_chassis(chassis)
@@ -590,6 +873,7 @@ def approach_object(
 
         if distance_cm <= PICKUP_TARGET_CM:
             stop_chassis(chassis)
+            current_speed = 0.0
             observation = tof.collect_fresh_observation(0.40)
             check_auto_keyboard(controls)
             stable_cm = observation.median_cm
@@ -612,17 +896,42 @@ def approach_object(
             time.sleep(CONTROL_LOOP_SEC)
             continue
 
-        speed = approach_speed(distance_cm)
+        target_speed = approach_speed(distance_cm)
+        dt = max(0.0, min(0.25, now - last_control))
+        last_control = now
+        current_speed = slew_toward(
+            current_speed,
+            target_speed,
+            APPROACH_ACCEL_MPS2 * dt,
+        )
+
+        z_cmd = 0.0
+        yaw_error: Optional[float] = None
+        current_yaw = attitude.yaw()
+        if (
+            APPROACH_HEADING_HOLD
+            and target_yaw is not None
+            and current_yaw is not None
+        ):
+            yaw_error = shortest_angle_error_deg(target_yaw, current_yaw)
+            if abs(yaw_error) > APPROACH_HEADING_DEADBAND_DEG:
+                desired_yaw_rate = clamp(
+                    yaw_error * APPROACH_HEADING_KP,
+                    -APPROACH_HEADING_MAX_Z_DPS,
+                    APPROACH_HEADING_MAX_Z_DPS,
+                )
+                z_cmd = desired_yaw_rate / APPROACH_DRIVE_TO_YAW_SIGN
+
         if ENABLE_MOTION:
-            chassis.drive_speed(
-                x=speed,
-                y=0.0,
-                z=0.0,
-                timeout=DRIVE_COMMAND_TIMEOUT_SEC,
-            )
+            drive_chassis(chassis, x=current_speed, y=0.0, z=z_cmd)
 
         if now - last_print >= TOF_PRINT_INTERVAL_SEC:
-            print(f"[APPROACH] ToF={distance_cm:5.1f} cm  speed={speed:.3f} m/s")
+            error_text = "---" if yaw_error is None else f"{yaw_error:+.1f}"
+            print(
+                f"[APPROACH] ToF={distance_cm:5.1f} cm "
+                f"x={current_speed:.3f} m/s z={z_cmd:+.1f} "
+                f"yaw_err={error_text}"
+            )
             last_print = now
 
         time.sleep(CONTROL_LOOP_SEC)
@@ -710,43 +1019,49 @@ def perform_grab_and_verify(
     gripper,
     tof: ToFReader,
     controls: KeyboardControls,
+    before_cm: float,
 ) -> bool:
-    """Open, grab, and run the down -> lift -> down ToF verification."""
+    """Lower/grab while ignoring occluded ToF, then verify after lifting."""
     check_auto_keyboard(controls)
     open_gripper(gripper, "OPEN FOR OBJECT")
+    check_auto_keyboard(controls)
+    
+    tof.paused = True # Added for FIX 3 (Pause ToF while arm moves down)
+    move_arm(arm, PICK_POSITION, "LOWER TO PICK / TOF IGNORED", controls)
+    tof.clear_measurement_history()
     check_auto_keyboard(controls)
     close_gripper(gripper, "CLOSE / GRAB")
     check_auto_keyboard(controls)
 
-    down_before = measure_down_object(tof, "D1 AFTER GRAB")
+    move_arm(arm, LIFT_POSITION, "LIFT FOR VERIFICATION", controls)
+    tof.paused = False # Added for FIX 3 (Resume ToF after lifting)
+    tof.clear_measurement_history()
     check_auto_keyboard(controls)
-    before_cm = down_before.median_cm
-    if (
-        before_cm is None
-        or len(down_before.valid_values_cm) < VERIFY_MIN_VALID_SAMPLES
-        or before_cm > GRABBED_OBJECT_MAX_CM
-    ):
-        print("[GRAB CHECK] FAIL: no stable close object after closing gripper")
-        return False
-
-    move_arm(arm, LIFT_POSITION, "LIFT FOR D2")
-    check_auto_keyboard(controls)
+    
     lifted = tof.collect_fresh_observation(VERIFY_WINDOW_SEC)
     check_auto_keyboard(controls)
     print(
-        f"[D2 LIFTED] median={lifted.median_cm} cm "
+        f"[LIFTED CHECK] median={lifted.median_cm} cm "
         f"valid={len(lifted.valid_values_cm)} "
         f"callbacks={lifted.callback_count} states={lifted.status_counts}"
     )
     lift_clear = lift_is_clear(before_cm, lifted)
 
-    # Always lower for the paired D1 -> D2 -> D3 check, even when D2 failed.
-    move_arm(arm, PICK_POSITION, "LOWER FOR D3")
-    check_auto_keyboard(controls)
-    down_after = measure_down_object(tof, "D3 LOWERED")
-    check_auto_keyboard(controls)
-    returned = object_returned(before_cm, down_after)
+    if not ENABLE_LOWER_RETURN_VERIFICATION:
+        print(
+            "[VERIFY] Lower-return ToF check skipped: PICK/LOWEST physically "
+            "occludes this robot's ToF"
+        )
+        return lift_clear
 
+    # Optional experiment only. It is disabled for the user's current mounting.
+    move_arm(arm, PICK_POSITION, "LOWER RETURN TEST", controls)
+    tof.clear_measurement_history()
+    check_auto_keyboard(controls)
+    down_after = measure_down_object(tof, "LOWER RETURN TEST")
+    returned = object_returned(before_cm, down_after)
+    move_arm(arm, LIFT_POSITION, "RESTORE CARRY AFTER RETURN TEST", controls)
+    tof.clear_measurement_history()
     return lift_clear and returned
 
 
@@ -754,6 +1069,7 @@ def automatic_recovery(
     chassis,
     arm,
     gripper,
+    tof: ToFReader,
     controls: KeyboardControls,
 ) -> None:
     """No user input: release, back away, then the loop performs Reset."""
@@ -761,13 +1077,14 @@ def automatic_recovery(
     check_auto_keyboard(controls)
     print("[RECOVERY] Release object and automatically retry")
     try:
-        move_arm(arm, PICK_POSITION, "RECOVERY PICK POSITION")
+        move_arm(arm, LIFT_POSITION, "RECOVERY LIFT / CARRY", controls)
+        tof.clear_measurement_history()
     except Exception as exc:
-        print(f"[RECOVERY WARNING] Could not move arm to PICK: {exc}")
+        print(f"[RECOVERY WARNING] Could not move arm to CARRY: {exc}")
     check_auto_keyboard(controls)
     open_gripper(gripper, "RECOVERY OPEN")
     check_auto_keyboard(controls)
-    back_away(chassis)
+    back_away(chassis, controls)
     check_auto_keyboard(controls)
     time.sleep(RETRY_SETTLE_SEC)
 
@@ -778,6 +1095,7 @@ def run_pickup_test(
     gripper,
     tof: ToFReader,
     controls: KeyboardControls,
+    attitude: AttitudeTracker,
 ) -> bool:
     attempt = 0
 
@@ -790,22 +1108,27 @@ def run_pickup_test(
         print("=" * 60)
 
         stop_chassis(chassis)
-        reset_pickup_arm(arm, gripper)
+        reset_pickup_arm(arm, gripper, controls, tof=tof)
         check_auto_keyboard(controls)
-        reached_cm = approach_object(chassis, tof, controls)
+        if not wait_for_tof_clear_after_lift(tof, controls):
+            print("[ATTEMPT FAILED] ToF remains blocked at LIFT/CARRY")
+            print("[AUTO STOP] Repeating cannot fix a persistent sensor occlusion")
+            return False
+
+        reached_cm = approach_object(chassis, tof, controls, attitude)
 
         if reached_cm is None:
             check_auto_keyboard(controls)
-            automatic_recovery(chassis, arm, gripper, controls)
+            automatic_recovery(chassis, arm, gripper, tof, controls)
             check_auto_keyboard(controls)
             continue
 
         stop_chassis(chassis)
         print(f"[PICKUP] Start grabbing at {reached_cm:.1f} cm")
 
-        if perform_grab_and_verify(arm, gripper, tof, controls):
-            print("\n[PICKUP SUCCESS] D1 -> D2 -> D3 verification passed")
-            move_arm(arm, LIFT_POSITION, "FINAL CARRY LIFT")
+        if perform_grab_and_verify(arm, gripper, tof, controls, reached_cm):
+            print("\n[PICKUP SUCCESS] Pre-pick -> lifted ToF verification passed")
+            print("[ARM] Already at FINAL LIFT/CARRY; duplicate move skipped")
             check_auto_keyboard(controls)
 
             if RELEASE_AFTER_SUCCESS:
@@ -817,7 +1140,7 @@ def run_pickup_test(
 
         print("\n[PICKUP FAILED] Verification failed")
         check_auto_keyboard(controls)
-        automatic_recovery(chassis, arm, gripper, controls)
+        automatic_recovery(chassis, arm, gripper, tof, controls)
         check_auto_keyboard(controls)
 
     print(f"[STOP] Pickup failed after {MAX_PICKUP_ATTEMPTS} attempts")
@@ -836,9 +1159,9 @@ def print_manual_help() -> None:
     print(" Hold A/D       : strafe left / right")
     print(" Hold Q/E       : rotate left / right")
     print(" SPACE          : emergency stop")
-    print(" 1 / 2 / 3      : HOME / PICK / LIFT arm position")
+    print(" 1 / 2 / 3      : HOME / PICK-LOWEST / LIFT-CARRY")
     print(" O / P          : open / close gripper")
-    print(" R              : reset HOME -> close -> PICK")
+    print(" R              : reset LIFT-CARRY -> close")
     print(" SHIFT + W      : intentional ToF safety override")
     print(" M              : stop and restart AUTO pickup")
     print(" H              : show this help")
@@ -846,7 +1169,14 @@ def print_manual_help() -> None:
     print("=" * 66)
 
 
-def execute_manual_command(command: str, chassis, arm, gripper) -> None:
+def execute_manual_command(
+    command: str,
+    chassis,
+    arm,
+    gripper,
+    tof: ToFReader,
+    controls: KeyboardControls,
+) -> None:
     """Execute one edge-triggered arm/gripper command with chassis stopped."""
     if command == "h":
         print_manual_help()
@@ -855,17 +1185,17 @@ def execute_manual_command(command: str, chassis, arm, gripper) -> None:
     stop_chassis(chassis)
 
     if command == "1":
-        move_arm(arm, HOME_POSITION, "MANUAL HOME")
+        move_arm(arm, HOME_POSITION, "MANUAL HOME", controls)
     elif command == "2":
-        move_arm(arm, PICK_POSITION, "MANUAL PICK")
+        move_arm(arm, PICK_POSITION, "MANUAL PICK", controls)
     elif command == "3":
-        move_arm(arm, LIFT_POSITION, "MANUAL LIFT")
+        move_arm(arm, LIFT_POSITION, "MANUAL LIFT", controls)
     elif command == "o":
         open_gripper(gripper, "MANUAL OPEN")
     elif command == "p":
         close_gripper(gripper, "MANUAL CLOSE")
     elif command == "r":
-        reset_pickup_arm(arm, gripper)
+        reset_pickup_arm(arm, gripper, controls, tof=tof)
 
 
 def manual_motion_command(
@@ -971,7 +1301,14 @@ def manual_control_loop(
 
         command = controls.pop_command()
         while command is not None:
-            execute_manual_command(command, chassis, arm, gripper)
+            execute_manual_command(
+                command,
+                chassis,
+                arm,
+                gripper,
+                tof,
+                controls,
+            )
             if controls.exit_requested():
                 stop_chassis(chassis)
                 return "EXIT"
@@ -988,12 +1325,7 @@ def manual_control_loop(
 
         motion = (x_cmd, y_cmd, z_cmd)
         if ENABLE_MOTION and motion != (0.0, 0.0, 0.0):
-            chassis.drive_speed(
-                x=x_cmd,
-                y=y_cmd,
-                z=z_cmd,
-                timeout=DRIVE_COMMAND_TIMEOUT_SEC,
-            )
+            drive_chassis(chassis, x=x_cmd, y=y_cmd, z=z_cmd)
         elif last_motion != (0.0, 0.0, 0.0):
             stop_chassis(chassis)
         last_motion = motion
@@ -1019,8 +1351,10 @@ def manual_control_loop(
 def main() -> None:
     ep_robot = robot.Robot()
     chassis = None
+    gripper = None
     tof_sensor = None
     tof_subscribed = False
+    attitude_subscribed = False
     controls = KeyboardControls()
     keyboard_started = False
 
@@ -1035,12 +1369,29 @@ def main() -> None:
         tof_sensor = ep_robot.sensor
 
         tof = ToFReader()
+        attitude = AttitudeTracker()
         tof_sensor.sub_distance(freq=TOF_FREQUENCY_HZ, callback=tof.callback)
         tof_subscribed = True
+        chassis.sub_attitude(
+            freq=ATTITUDE_FREQUENCY_HZ,
+            callback=attitude.callback,
+        )
+        attitude_subscribed = True
 
         controls.start()
         keyboard_started = True
         print("Keyboard control ready: M=toggle mode, SPACE=stop, ESC=exit")
+        print(f"Version: {PROGRAM_VERSION}")
+        print(f"Arm PICK/LOWEST: {PICK_POSITION}")
+        print(f"Arm LIFT/CARRY : {LIFT_POSITION}")
+        print(
+            f"Approach yaw hold: {'ON' if APPROACH_HEADING_HOLD else 'OFF'} "
+            f"deadband={APPROACH_HEADING_DEADBAND_DEG:.1f} deg"
+        )
+        print(
+            f"Gripper power  : open={GRIPPER_OPEN_POWER}% "
+            f"close={GRIPPER_CLOSE_POWER}%"
+        )
 
         print("Waiting for the first ToF callback...")
         tof_ready = tof.wait_for_first_callback(TOF_STARTUP_TIMEOUT_SEC)
@@ -1079,6 +1430,7 @@ def main() -> None:
                         gripper,
                         tof,
                         controls,
+                        attitude,
                     )
                 except ManualModeRequested:
                     stop_chassis(chassis)
@@ -1124,32 +1476,52 @@ def main() -> None:
                 continue
             break
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ProgramExitRequested):
         print("\nSTOP REQUESTED BY USER")
+
+    except TimeoutError as exc:
+        print(f"\n[ACTION TIMEOUT] {exc}")
+        print("Stopping and disconnecting for safety")
 
     except Exception as exc:
         print(f"\nERROR: {exc}")
         raise
 
     finally:
-        stop_chassis(chassis)
+        stop_chassis(chassis, force=True)
+
+        if gripper is not None:
+            run_cleanup_with_timeout(
+                "gripper pause",
+                gripper.pause,
+            )
 
         if keyboard_started:
             controls.stop()
 
         if tof_sensor is not None and tof_subscribed:
-            try:
-                tof_sensor.unsub_distance()
-            except Exception:
-                pass
+            run_cleanup_with_timeout(
+                "ToF unsubscribe",
+                tof_sensor.unsub_distance,
+            )
 
-        try:
-            ep_robot.close()
-        except Exception:
-            pass
+        if chassis is not None and attitude_subscribed:
+            run_cleanup_with_timeout(
+                "attitude unsubscribe",
+                chassis.unsub_attitude,
+            )
 
-        print("Robot stopped and disconnected")
+        close_ok = run_cleanup_with_timeout(
+            "robot close",
+            ep_robot.close,
+        )
+
+        if close_ok:
+            print("Robot stopped and disconnected")
+        else:
+            print("Robot stop requested; SDK cleanup did not finish in time")
 
 
 if __name__ == "__main__":
     main()
+    
