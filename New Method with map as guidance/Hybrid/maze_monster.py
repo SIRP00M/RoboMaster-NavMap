@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field
 from dataclasses import dataclass as _map_dataclass
 from typing import Dict, List, Optional, Tuple
 ENABLE_MOTION = True
-PROGRAM_VERSION = 'V12.5.1_ROUTE_LOCKED_ENTRY_ANY_SENSOR'
+PROGRAM_VERSION = 'V12.5.2_MAP_EXIT_LOCK_AND_ENTRY_BARRIER'
 IR_FRONT_LEFT_ID = 1
 SHARP_LEFT_ID = 2
 SHARP_RIGHT_ID = 3
@@ -306,9 +306,17 @@ EXIT_READY_CONFIRM_SAMPLES = 2
 
 ENABLE_START_GATE_GUARD = True
 START_GATE_LEARN_DISTANCE_M = 0.12
-START_GATE_HALF_WIDTH_M = 0.45
+START_GATE_HALF_WIDTH_M = 0.85
 START_GATE_BLOCK_INNER_M = 0.2
 START_GATE_RECOVERY_COOLDOWN_SEC = 1.0
+# When returning toward the old entrance, do not wait for a wide opening window
+# to finish after the robot has already crossed the branch mouth. Finalize the
+# active junction window before the chassis reaches the virtual start barrier;
+# the normal guide/DFS decision then chooses a mapped branch.
+ENABLE_START_GATE_EARLY_DECISION_BARRIER = True
+START_GATE_DECISION_TRIGGER_PROGRESS_M = 0.70
+START_GATE_DECISION_TRIGGER_LATERAL_M = 0.85
+START_GATE_DECISION_MIN_WINDOW_M = 0.08
 # The chassis may be placed in a wall-free staging area before the physical
 # entrance.  Until a corridor/landmark is acquired, drive inward with heading
 # hold but suppress junction and exit detection so the staging-area boundary
@@ -332,7 +340,7 @@ START_ENTRY_MAX_TRAVEL_M = 1.50
 START_ENTRY_MAX_SEC = 15.0
 START_EXIT_REJECT_RADIUS_M = 0.9
 START_EXIT_REJECT_INNER_PROGRESS_M = 0.45
-START_EXIT_REJECT_LATERAL_M = 0.65
+START_EXIT_REJECT_LATERAL_M = 1.25
 EXPLORATION_FRONT_OPEN_CM = 35.0
 JUNCTION_CONFIRM_SAMPLES = 3
 JUNCTION_REARM_SAMPLES = 4
@@ -2212,6 +2220,36 @@ class DecisionPointDetector:
         self.pending_zone_event = None
         return event
 
+    def force_finalize_active_intersection(
+        self, pose_x, pose_y, reason='VIRTUAL_BARRIER', minimum_length_m=0.0,
+    ):
+        """Close a proven side-opening window before crossing a safety barrier.
+
+        This never invents an opening: the normal tracker must already have
+        started an intersection window from stable Sharp evidence. The event is
+        consumed by the ordinary rolling scan and guide/DFS decision pipeline.
+        """
+        w = self.intersection_window
+        if not w.get('active', False):
+            return None
+        min_samples = int(config.INTERSECTION_MIN_OPEN_SAMPLES)
+        side_samples = max(
+            int(w.get('left_open_samples', 0)),
+            int(w.get('right_open_samples', 0)),
+        )
+        if side_samples < min_samples:
+            return None
+        length = self._distance_xy(w.get('start_x'), w.get('start_y'), pose_x, pose_y)
+        length = float(length or 0.0)
+        if length < max(0.0, float(minimum_length_m)):
+            return None
+        event = self._finalize_intersection_window(pose_x, pose_y, reason)
+        if event is None:
+            return None
+        self.pending_zone_event = event
+        self._latch_now(time.monotonic(), pose_x, pose_y)
+        return event
+
     def release_after_front_drive_through(self, event):
         """Fast re-arm after FRONT only when a corridor gap was already proven."""
         if not bool(getattr(config, 'ENABLE_ADAPTIVE_JUNCTION_REGION', False)):
@@ -3288,6 +3326,8 @@ class TopologicalMazeGuide:
         self.hypotheses = []
         self.initialized = False
         self.exit_hint_reached = False
+        self.exit_route_committed = False
+        self.exit_route_commit_ratio = 0.0
         self._announced_marker_keys = set()
         self._pending_mission_event = None
         self._relocalized_since_anchor = False
@@ -3731,6 +3771,8 @@ class TopologicalMazeGuide:
         self._relocalized_since_anchor = False
         self._relocalize_consistent_transitions = 0
         self._departure_since_relocalize = False
+        self.exit_route_committed = False
+        self.exit_route_commit_ratio = 0.0
         self.last_status = '8 ORIENTATION HYPOTHESES'
         if bool(getattr(config, 'GUIDE_DEBUG', True)):
             print('>>> MAP GUIDE initialized: 4 rotations x mirror/no-mirror; START heading ignored')
@@ -3739,6 +3781,27 @@ class TopologicalMazeGuide:
         """Advance each hypothesis along the edge the robot actually chose."""
         if not self.initialized or not self.hypotheses:
             return
+        active_marker = self.active_target()
+        exit_targets = set(self.marker_nodes.get('EXIT', []))
+        weighted = self._weighted_hypotheses()
+        total_weight = sum(weight for _, weight in weighted)
+        exit_weight = 0.0
+        if active_marker == 'EXIT' and exit_targets:
+            for old, weight in weighted:
+                map_abs = self._robot_to_map_dir(old, robot_abs_index)
+                target = self._edge_target(old.map_node_id, map_abs)
+                if target in exit_targets:
+                    exit_weight += weight
+        exit_ratio = exit_weight / total_weight if total_weight > 0.0 else 0.0
+        exit_threshold = float(
+            getattr(config, 'GUIDE_MARKER_CONSENSUS_RATIO', 0.72)
+        )
+        exit_departure_approved = bool(
+            active_marker == 'EXIT'
+            and exit_targets
+            and (not self._relocalized_since_anchor)
+            and exit_ratio >= exit_threshold
+        )
         advanced = []
         for old in self.hypotheses:
             hypothesis = self._copy_hypothesis(old)
@@ -3753,6 +3816,14 @@ class TopologicalMazeGuide:
             hypothesis.score += 0.10
             advanced.append(hypothesis)
         self.hypotheses = self._prune(advanced)
+        if active_marker == 'EXIT':
+            self.exit_route_committed = bool(exit_departure_approved and self.hypotheses)
+            self.exit_route_commit_ratio = exit_ratio if self.exit_route_committed else 0.0
+            if self.exit_route_committed and bool(getattr(config, 'GUIDE_DEBUG', True)):
+                print(
+                    f'>>> MAP GUIDE EXIT APPROACH COMMITTED consensus='
+                    f'{self.exit_route_commit_ratio:.0%} reason={reason}'
+                )
         if self.hypotheses and self._relocalized_since_anchor:
             self._departure_since_relocalize = True
         if not self.hypotheses:
@@ -3781,6 +3852,8 @@ class TopologicalMazeGuide:
         self._relocalized_since_anchor = True
         self._relocalize_consistent_transitions = 0
         self._departure_since_relocalize = False
+        self.exit_route_committed = False
+        self.exit_route_commit_ratio = 0.0
         self.last_status = 'GLOBAL TOPOLOGY RELOCALIZATION'
         if bool(getattr(config, 'GUIDE_DEBUG', True)):
             print(f'>>> MAP GUIDE relocalized from local topology: {len(self.hypotheses)} hypotheses')
@@ -3844,6 +3917,15 @@ class TopologicalMazeGuide:
             self.stage_index += 1
         return None
 
+    def physical_exit_allowed(self):
+        """Allow open-area EXIT proof only on a map-approved final approach."""
+        marker = self.active_target()
+        if marker != 'EXIT':
+            return False
+        if not self.marker_nodes.get('EXIT'):
+            return True
+        return bool(self.exit_hint_reached or self.exit_route_committed)
+
     def _weighted_hypotheses(self):
         if not self.hypotheses:
             return []
@@ -3889,6 +3971,8 @@ class TopologicalMazeGuide:
             }
         if marker == 'EXIT':
             self.exit_hint_reached = True
+            self.exit_route_committed = True
+            self.exit_route_commit_ratio = max(self.exit_route_commit_ratio, ratio)
             return
         if bool(getattr(config, 'GUIDE_AUTO_ADVANCE_PICKUP_DROP', True)):
             self.stage_index += 1
@@ -3957,6 +4041,10 @@ class TopologicalMazeGuide:
             physical_abs.add((explorer.heading_index - 1) % 4)
         if scan.get('right_open'):
             physical_abs.add((explorer.heading_index + 1) % 4)
+        forbidden_abs = {
+            int(value) % 4 for value in (scan.get('forbidden_abs') or set())
+        }
+        physical_abs.difference_update(forbidden_abs)
         if explorer.current_node_id == explorer.start_node_id and explorer.start_outside_abs_dir is not None:
             physical_abs.discard(explorer.start_outside_abs_dir % 4)
 
@@ -4610,7 +4698,7 @@ def stop_chassis(chassis):
 def print_startup_info():
     print()
     print('==========================================================')
-    print(' MAZE SOLVER V12.5.1 - ROUTE GUIDE + ANY-SENSOR ENTRY')
+    print(' MAZE SOLVER V12.5.2 - MAP EXIT LOCK + ENTRY BARRIER')
     print('==========================================================')
     print()
     print(f'Program version     : {config.PROGRAM_VERSION}')
@@ -4667,6 +4755,11 @@ def print_startup_info():
     print(f'Open Area           : {config.ENABLE_OPEN_AREA_HEADING_HOLD} (side>={config.OPEN_AREA_SIDE_ENTER_CM:.0f} cm, front>={config.OPEN_AREA_FRONT_MIN_CM:.0f} cm)')
     print(f'Exit Detection      : {config.ENABLE_EXIT_DETECTION} (front>={config.EXIT_FRONT_START_CM:.0f} cm, sides>={config.EXIT_SIDE_START_CM:.0f} cm)')
     print(f'Start Gate Guard    : {config.ENABLE_START_GATE_GUARD} (block outside J0 + geometric guard)')
+    print(
+        f'Entrance Barrier    : {getattr(config, "ENABLE_START_GATE_EARLY_DECISION_BARRIER", True)} '
+        f'(force junction decision before progress<='
+        f'{getattr(config, "START_GATE_DECISION_TRIGGER_PROGRESS_M", 0.70):.2f}m)'
+    )
     print(
         f'Start Entry Acquire : {getattr(config, "ENABLE_START_ENTRY_ACQUISITION", True)} '
         f'(nudge={getattr(config, "START_ENTRY_NUDGE_DISTANCE_M", 0.05):.2f}m '
@@ -5668,6 +5761,26 @@ class StartGateGuard:
             return True
         return False
 
+    def should_force_junction_decision(self, x, y, heading_index):
+        """True near the old entrance while travelling in the outward heading."""
+        if not bool(
+            getattr(config, 'ENABLE_START_GATE_EARLY_DECISION_BARRIER', True)
+        ):
+            return False
+        if not self.is_outward_heading(heading_index):
+            return False
+        m = self.metrics(x, y)
+        if not m['learned'] or m['progress_m'] is None or m['lateral_m'] is None:
+            return False
+        return bool(
+            m['progress_m'] <= float(
+                getattr(config, 'START_GATE_DECISION_TRIGGER_PROGRESS_M', 0.70)
+            )
+            and m['lateral_m'] <= float(
+                getattr(config, 'START_GATE_DECISION_TRIGGER_LATERAL_M', 0.85)
+            )
+        )
+
     def should_force_return(self, x, y, heading_index):
         if not bool(getattr(config, 'ENABLE_START_GATE_GUARD', True)):
             return False
@@ -6547,6 +6660,17 @@ def choose_v11_decision(explorer, edge_memory, scan, guide=None):
         guided = guide.recommend(explorer, scan)
         if guided is not None:
             return (guided, None)
+    if bool(scan.get('entry_barrier_active', False)):
+        # If map alignment is temporarily uncertain at the old entrance, fail
+        # closed by returning inward. Never let DFS select physical FRONT and
+        # leave through the entrance while an EXIT marker exists elsewhere.
+        inward_abs = explorer.opposite_index(explorer.heading_index)
+        safe = explorer.decision_for_absolute(
+            inward_abs,
+            reason='ENTRY_BARRIER_GUIDE_UNCERTAIN_RETURN',
+        )
+        if safe is not None:
+            return (safe, None)
     latent_plan = None
     if decision.direction == 'COMPLETE' and decision.reason == 'ALL_FRONTIERS_EXPLORED' and bool(getattr(config, 'ENABLE_LATENT_FRONTIER_VERIFICATION', True)):
         latent_plan = edge_memory.plan_verification(explorer)
@@ -6793,7 +6917,34 @@ def maze_main(guide_path=None, disable_guide=False):
                 continue
 
             start_gate_block_exit = start_gate.should_reject_exit(pose_x, pose_y, explorer.heading_index)
-            if start_gate.should_force_return(pose_x, pose_y, explorer.heading_index):
+            hard_start_gate_due = start_gate.should_force_return(
+                pose_x, pose_y, explorer.heading_index,
+            )
+            start_gate_forced_decision = False
+            if (
+                start_gate.should_force_junction_decision(
+                    pose_x, pose_y, explorer.heading_index,
+                )
+                and detector.intersection_window.get('active', False)
+            ):
+                minimum_window = 0.0 if hard_start_gate_due else float(
+                    getattr(config, 'START_GATE_DECISION_MIN_WINDOW_M', 0.08)
+                )
+                barrier_event = detector.force_finalize_active_intersection(
+                    pose_x,
+                    pose_y,
+                    reason='START_GATE_VIRTUAL_BARRIER',
+                    minimum_length_m=minimum_window,
+                )
+                if barrier_event is not None:
+                    stop_chassis(chassis)
+                    start_gate_forced_decision = True
+                    fsm_state = 'NODE_PROCESS_START_GATE_BARRIER'
+                    print(
+                        '>>> START GATE VIRTUAL BARRIER: active junction '
+                        'finalized before old entrance'
+                    )
+            if hard_start_gate_due and (not start_gate_forced_decision):
                 metrics = start_gate.metrics(pose_x, pose_y)
                 print()
                 print('============================================')
@@ -6835,15 +6986,23 @@ def maze_main(guide_path=None, disable_guide=False):
                 continue
             open_state = open_area_exit.update(nav_front_cm, sharp_left_cm, sharp_right_cm, pose_x, pose_y, node_count=len(explorer.nodes), heading_error=heading_error, start_gate_block_exit=start_gate_block_exit)
             active_mission_target = guide.active_target() if guide is not None else None
-            mission_exit_allowed = guide is None or active_mission_target in (None, 'EXIT')
+            mission_exit_allowed = (
+                guide is None
+                or bool(guide.physical_exit_allowed())
+            )
             if not mission_exit_allowed:
                 open_area_exit.cancel_exit_candidate(
-                    f'MISSION_STAGE_{active_mission_target}'
+                    f'MAP_EXIT_LOCK_{active_mission_target or "NO_TARGET"}'
                 )
                 open_state['exit_candidate_active'] = False
                 open_state['exit_ready'] = False
                 open_state['exit_found'] = False
-            decision_event = detector.update(nav_front_cm, sharp_left_cm, sharp_right_cm, pose_x=pose_x, pose_y=pose_y)
+            decision_event = start_gate_forced_decision
+            if not decision_event:
+                decision_event = detector.update(
+                    nav_front_cm, sharp_left_cm, sharp_right_cm,
+                    pose_x=pose_x, pose_y=pose_y,
+                )
             forced_edge_zone = None
             if not decision_event and edge_event is not None:
                 normal_tracker_active = bool(detector.intersection_window.get('active', False) or detector.left_zone.get('active', False) or detector.right_zone.get('active', False))
@@ -6938,6 +7097,15 @@ def maze_main(guide_path=None, disable_guide=False):
                             node_pose_x, node_pose_y = (0.0, 0.0)
                     if mapper is not None and config.ENABLE_MAPPING:
                         mapper.update(node_pose_x, node_pose_y, pose_tracker.get_yaw(), front_cm=scan['front_cm'], left_cm=scan['left_cm'], right_cm=scan['right_cm'], ir_value=None, heading_index=explorer.heading_index, mode='JUNCTION_SCAN', map_ranges=True, force=True)
+
+                if start_gate_forced_decision:
+                    scan['entry_barrier_active'] = True
+                    scan['forbidden_abs'] = {explorer.heading_index % 4}
+                    print(
+                        f'>>> ENTRY BARRIER forbids FRONT/'
+                        f'{explorer.heading_name(explorer.heading_index)} '
+                        'through the old entrance'
+                    )
 
                 observed_abs = {explorer.opposite_index(explorer.heading_index)}
                 if scan.get('front_open'):
