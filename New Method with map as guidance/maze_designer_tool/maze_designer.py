@@ -24,7 +24,9 @@ import json
 import math
 import os
 import sys
+import copy
 import tkinter as tk
+import customtkinter as ctk
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -546,105 +548,398 @@ def save_plan(path: str, plan: dict) -> None:
 # GUI
 # -----------------------------------------------------------------------------
 
+
+try:
+    from PIL import Image, ImageTk, ImageGrab
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 class MazeDesignerApp:
     CELL_PX = 62
     PAD = 28
     EDGE_PICK_PX = 12
 
-    def __init__(self, root: tk.Tk, rows: int = 8, cols: int = 10, cell_size_m: float = 0.40):
+    def __init__(self, root: ctk.CTk, rows: int = 8, cols: int = 10, cell_size_m: float = 0.40):
         self.root = root
-        self.root.title("RoboMaster Pre-drawn Maze Designer")
+        self.root.title("RoboMaster Pre-drawn Maze Designer (Y2K Edition + Pro)")
+        
+        # Y2K Theme Colors
+        self.color_bg = "#d6e5ff"       
+        self.color_sidebar = "#7ea8f8"  
+        self.color_text = "#1f2a63"     
+        self.color_btn_green = "#b1f071" 
+        self.color_btn_yellow = "#fff785" 
+        self.color_btn_hover = "#95d654"
+        self.color_yellow_hover = "#e6de65"
+        self.color_border = "#1f2a63"
+        
+        ctk.set_appearance_mode("Light")
+        self.root.configure(fg_color=self.color_bg)
+        
+        self.font_main = ctk.CTkFont(family="Courier New", size=14, weight="bold")
+        self.font_title = ctk.CTkFont(family="Courier New", size=22, weight="bold")
+        
         self.maze = MazeData(rows=rows, cols=cols, cell_size_m=cell_size_m)
         self.mode = tk.StringVar(value="WALL")
-        self.status = tk.StringVar(value="Draw walls, then place START / PICKUP / DROP / EXIT")
+        self.status = tk.StringVar(value="Ready! Use W/E/S/P/D/X keys to switch modes.")
         self.route: List[Cell] = []
         self.route_plan: Optional[dict] = None
         self.current_file: Optional[str] = None
+        self.appearance_mode = "Light"
+        
+        # --- NEW: History System ---
+        self.history_undo = []
+        self.history_redo = []
+        
+        # --- NEW: Animation System ---
+        self.anim_id = None
+        self.anim_index = 0
+        self.robot_image = None
+        self.robot_frames = []
+        self.current_frame_idx = 0
+        self.gif_anim_id = None
+        self.load_icon()
 
         self._build_ui()
-        self._resize_canvas()
+        self._resize_window()
         self.redraw()
+        
+        # --- NEW: Key Bindings ---
+        self.root.bind("<Control-z>", self.undo)
+        self.root.bind("<Control-y>", self.redo)
+        self.root.bind("<Key>", self.on_key_press)
+        self.root.bind("<Button-1>", lambda e: self.root.focus_set())
+
+    def load_icon(self):
+        if HAS_PIL:
+            assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+            if not os.path.exists(assets_dir): return
+            for f in os.listdir(assets_dir):
+                if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
+                    path = os.path.join(assets_dir, f)
+                    try:
+                        img = Image.open(path)
+                        is_gif = f.lower().endswith(".gif")
+                        size = int(self.CELL_PX * 3.2)
+                        
+                        try:
+                            while True:
+                                frame = img.convert("RGBA")
+                                data = frame.getdata()
+                                new_data = []
+                                for item in data:
+                                    if item[0] > 235 and item[1] > 235 and item[2] > 235:
+                                        new_data.append((255, 255, 255, 0))
+                                    elif item[0] < 150 and item[1] > 200 and item[2] < 150:
+                                        new_data.append((0, 255, 0, 0))
+                                    else:
+                                        new_data.append(item)
+                                frame.putdata(new_data)
+                                frame = frame.resize((size, size), Image.Resampling.LANCZOS)
+                                self.robot_frames.append(ImageTk.PhotoImage(frame))
+                                
+                                if not is_gif: break
+                                img.seek(img.tell() + 1)
+                        except EOFError:
+                            pass
+                            
+                        if self.robot_frames:
+                            self.robot_image = self.robot_frames[0]
+                        break
+                    except Exception as e:
+                        print(f"Error loading icon: {e}")
+
+    def update_gif_frame(self):
+        if not hasattr(self, 'robot_frames') or len(self.robot_frames) <= 1:
+            return
+        # Stop animating if route finished
+        if self.anim_index >= len(self.route):
+            return
+            
+        self.current_frame_idx = (self.current_frame_idx + 1) % len(self.robot_frames)
+        self.robot_image = self.robot_frames[self.current_frame_idx]
+        
+        if self.canvas.find_withtag("robot"):
+            self.canvas.itemconfig("robot", image=self.robot_image)
+            
+        self.gif_anim_id = self.root.after(80, self.update_gif_frame)
+
+    def save_state(self):
+        self.history_undo.append(copy.deepcopy(self.maze))
+        self.history_redo.clear()
+
+    def undo(self, event=None):
+        if self.history_undo:
+            self.history_redo.append(copy.deepcopy(self.maze))
+            self.maze = self.history_undo.pop()
+            self.clear_route()
+            self.status.set("Undo successful.")
+            self.redraw()
+
+    def redo(self, event=None):
+        if self.history_redo:
+            self.history_undo.append(copy.deepcopy(self.maze))
+            self.maze = self.history_redo.pop()
+            self.clear_route()
+            self.status.set("Redo successful.")
+            self.redraw()
+
+    def on_key_press(self, event):
+        if isinstance(event.widget, (tk.Entry, ctk.CTkEntry)):
+            return
+        if not event.char: return
+        char = event.char.lower()
+        if char == 'w': self.mode.set("WALL")
+        elif char == 'e': self.mode.set("ERASE")
+        elif char == 's': self.mode.set("START")
+        elif char == 'p': self.mode.set("PICKUP")
+        elif char == 'd': self.mode.set("DROP")
+        elif char == 'x': self.mode.set("EXIT")
 
     def _build_ui(self):
-        top = tk.Frame(self.root, padx=8, pady=7)
-        top.pack(fill="x")
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(1, weight=1)
+
+        # Sidebar
+        self.sidebar_frame = ctk.CTkFrame(
+            self.root, width=240, corner_radius=10, 
+            fg_color=self.color_sidebar, border_width=3, border_color=self.color_border
+        )
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.sidebar_frame.grid_rowconfigure(11, weight=1)
+
+        logo_label = ctk.CTkLabel(
+            self.sidebar_frame, text="E kae\nMaze Designer", 
+            font=self.font_title, text_color="white"
+        )
+        logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+
+        # Mode Selection
+        self.mode_label = ctk.CTkLabel(
+            self.sidebar_frame, text="* DRAWING MODE *", anchor="w", 
+            font=self.font_main, text_color="white"
+        )
+        self.mode_label.grid(row=1, column=0, padx=20, pady=(10, 5), sticky="w")
 
         modes = [
-            ("Wall", "WALL"),
-            ("Erase wall", "ERASE"),
-            ("Start", "START"),
-            ("Pickup", "PICKUP"),
-            ("Drop", "DROP"),
-            ("Exit", "EXIT"),
+            ("Wall (W)", "WALL"),
+            ("Erase (E)", "ERASE"),
+            ("Start (S)", "START"),
+            ("Pickup (P)", "PICKUP"),
+            ("Drop (D)", "DROP"),
+            ("Exit (X)", "EXIT"),
         ]
-        for text, value in modes:
-            tk.Radiobutton(top, text=text, value=value, variable=self.mode, indicatoron=False, width=11).pack(side="left", padx=2)
+        
+        self.radio_buttons = []
+        for i, (text, value) in enumerate(modes):
+            rb = ctk.CTkRadioButton(
+                self.sidebar_frame, text=text.upper(), variable=self.mode, value=value,
+                font=self.font_main, text_color="white",
+                fg_color=self.color_btn_yellow, border_color="white", hover_color=self.color_btn_green
+            )
+            rb.grid(row=2+i, column=0, pady=6, padx=30, sticky="w")
+            self.radio_buttons.append(rb)
 
-        tk.Button(top, text="Preview Guide", command=self.preview_route).pack(side="left", padx=(10, 2))
-        tk.Button(top, text="Clear Route", command=self.clear_route).pack(side="left", padx=2)
-
-        second = tk.Frame(self.root, padx=8, pady=3)
-        second.pack(fill="x")
-        tk.Button(second, text="New", command=self.new_maze).pack(side="left", padx=2)
-        tk.Button(second, text="Save Maze", command=self.save_maze_dialog).pack(side="left", padx=2)
-        tk.Button(second, text="Load Maze", command=self.load_maze_dialog).pack(side="left", padx=2)
-        tk.Button(second, text="Export Route", command=self.export_route_dialog).pack(side="left", padx=2)
-
-        tk.Label(second, text="Cell size hint (m):").pack(side="left", padx=(14, 3))
-        self.cell_size_entry = tk.Entry(second, width=7)
-        self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
-        self.cell_size_entry.pack(side="left")
-        tk.Button(second, text="Apply", command=self.apply_cell_size).pack(side="left", padx=3)
-
-        info = tk.Label(
-            self.root,
-            text=(
-                "WALL/ERASE: click near an internal cell edge. Markers: click inside a cell.  "
-                "Drawing orientation and block size are hints; robot auto-tests rotations/mirror and trusts sensors."
-            ),
-            anchor="w",
-            padx=10,
+        # Actions
+        actions_label = ctk.CTkLabel(
+            self.sidebar_frame, text="* ACTIONS *", anchor="w", 
+            font=self.font_main, text_color="white"
         )
-        info.pack(fill="x")
+        actions_label.grid(row=8, column=0, padx=20, pady=(15, 0), sticky="w")
 
-        self.canvas = tk.Canvas(self.root, bg="#f5f5f5", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=8, pady=6)
+        self.btn_preview = ctk.CTkButton(
+            self.sidebar_frame, text="PREVIEW ANIMATION", command=self.preview_route,
+            font=self.font_main, fg_color=self.color_btn_green, text_color=self.color_text,
+            border_width=2, border_color=self.color_border, hover_color=self.color_btn_hover, corner_radius=15
+        )
+        self.btn_preview.grid(row=9, column=0, padx=20, pady=5)
+        
+        self.btn_clear = ctk.CTkButton(
+            self.sidebar_frame, text="CLEAR ANIMATION", command=self.clear_route, 
+            font=self.font_main, fg_color=self.color_btn_yellow, text_color=self.color_text,
+            border_width=2, border_color=self.color_border, hover_color=self.color_yellow_hover, corner_radius=15
+        )
+        self.btn_clear.grid(row=10, column=0, padx=20, pady=5)
+        
+        # Undo/Redo
+        ur_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        ur_frame.grid(row=11, column=0, pady=5)
+        ctk.CTkButton(ur_frame, text="UNDO", width=70, font=self.font_main, command=self.undo, 
+                     border_width=2, border_color=self.color_border, fg_color="#fff", text_color="#000").pack(side="left", padx=5)
+        ctk.CTkButton(ur_frame, text="REDO", width=70, font=self.font_main, command=self.redo,
+                     border_width=2, border_color=self.color_border, fg_color="#fff", text_color="#000").pack(side="left", padx=5)
+
+        self.sidebar_frame.grid_rowconfigure(12, weight=1)
+
+        # File Operations
+        self.btn_new = ctk.CTkButton(
+            self.sidebar_frame, text="NEW MAZE", command=self.new_maze,
+            font=self.font_main, fg_color="white", text_color=self.color_text,
+            border_width=2, border_color=self.color_border, hover_color="#eeeeee", corner_radius=8
+        )
+        self.btn_new.grid(row=13, column=0, padx=20, pady=5)
+        
+        self.btn_save = ctk.CTkButton(
+            self.sidebar_frame, text="SAVE MAZE", command=self.save_maze_dialog,
+            font=self.font_main, fg_color="white", text_color=self.color_text,
+            border_width=2, border_color=self.color_border, hover_color="#eeeeee", corner_radius=8
+        )
+        self.btn_save.grid(row=14, column=0, padx=20, pady=5)
+        
+        self.btn_load = ctk.CTkButton(
+            self.sidebar_frame, text="LOAD MAZE", command=self.load_maze_dialog,
+            font=self.font_main, fg_color="white", text_color=self.color_text,
+            border_width=2, border_color=self.color_border, hover_color="#eeeeee", corner_radius=8
+        )
+        self.btn_load.grid(row=15, column=0, padx=20, pady=5)
+        
+        self.btn_export = ctk.CTkButton(
+            self.sidebar_frame, text="EXPORT ROUTE", command=self.export_route_dialog, 
+            font=self.font_main, fg_color="#ff9eb5", text_color="white",
+            border_width=2, border_color=self.color_border, hover_color="#e07790", corner_radius=8
+        )
+        self.btn_export.grid(row=16, column=0, padx=20, pady=5)
+        
+        self.btn_png = ctk.CTkButton(
+            self.sidebar_frame, text="SAVE AS PNG 📸", command=self.export_png_dialog, 
+            font=self.font_main, fg_color="#91d2ff", text_color="white",
+            border_width=2, border_color=self.color_border, hover_color="#7cbce8", corner_radius=8
+        )
+        self.btn_png.grid(row=17, column=0, padx=20, pady=(5, 20))
+
+        # Main Frame
+        self.main_frame = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, sticky="nsew", pady=10, padx=(0, 10))
+        self.main_frame.grid_rowconfigure(1, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+
+        # Top Bar (Cell Size + Grid Size)
+        self.top_bar = ctk.CTkFrame(
+            self.main_frame, height=50, corner_radius=10, 
+            fg_color="white", border_width=3, border_color=self.color_border
+        )
+        self.top_bar.grid(row=0, column=0, sticky="ew")
+        
+        # Dynamic Grid Inputs
+        ctk.CTkLabel(self.top_bar, text="R:", font=self.font_main, text_color=self.color_text).pack(side="left", padx=(10,2), pady=10)
+        self.rows_entry = ctk.CTkEntry(self.top_bar, width=40, font=self.font_main, border_width=2, border_color=self.color_border)
+        self.rows_entry.insert(0, str(self.maze.rows))
+        self.rows_entry.pack(side="left", padx=2, pady=10)
+        
+        ctk.CTkLabel(self.top_bar, text="C:", font=self.font_main, text_color=self.color_text).pack(side="left", padx=(5,2), pady=10)
+        self.cols_entry = ctk.CTkEntry(self.top_bar, width=40, font=self.font_main, border_width=2, border_color=self.color_border)
+        self.cols_entry.insert(0, str(self.maze.cols))
+        self.cols_entry.pack(side="left", padx=2, pady=10)
+        
+        ctk.CTkLabel(self.top_bar, text="SIZE(M):", font=self.font_main, text_color=self.color_text).pack(side="left", padx=(10,2), pady=10)
+        self.cell_size_entry = ctk.CTkEntry(self.top_bar, width=50, font=self.font_main, border_width=2, border_color=self.color_border)
+        self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
+        self.cell_size_entry.pack(side="left", padx=2, pady=10)
+        
+        ctk.CTkButton(
+            self.top_bar, text="APPLY GRID", command=self.apply_grid_settings, width=80,
+            font=self.font_main, fg_color=self.color_btn_green, text_color=self.color_text,
+            border_width=2, border_color=self.color_border, hover_color=self.color_btn_hover
+        ).pack(side="left", padx=10, pady=10)
+        
+        info_text = "Click internal edges for WALLS.\nClick inside cells for MARKERS."
+        ctk.CTkLabel(
+            self.top_bar, text=info_text, text_color=self.color_sidebar, 
+            font=ctk.CTkFont(family="Courier New", size=11, weight="bold"), justify="right"
+        ).pack(side="right", padx=15)
+
+        # Canvas Setup
+        self.canvas_frame = ctk.CTkFrame(
+            self.main_frame, corner_radius=10, fg_color="white", 
+            border_width=3, border_color=self.color_border
+        )
+        self.canvas_frame.grid(row=1, column=0, sticky="nsew", pady=10)
+        
+        self.canvas_title = ctk.CTkLabel(
+            self.canvas_frame, text=" MAZE VIEW ", font=self.font_main, 
+            text_color="white", fg_color=self.color_sidebar, corner_radius=0
+        )
+        self.canvas_title.pack(fill="x", padx=3, pady=(3, 0))
+
+        self.canvas_bg = "#f4f8ff"
+        self.canvas = tk.Canvas(self.canvas_frame, bg=self.canvas_bg, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True, padx=3, pady=(0, 3))
         self.canvas.bind("<Button-1>", self.on_click)
 
-        tk.Label(self.root, textvariable=self.status, anchor="w", relief="sunken", padx=8).pack(fill="x", side="bottom")
+        # Status Bar
+        self.status_label = ctk.CTkLabel(
+            self.main_frame, textvariable=self.status, anchor="w", 
+            font=self.font_main, text_color=self.color_text, 
+            fg_color=self.color_btn_yellow, corner_radius=10,
+            border_width=2, border_color=self.color_border, padx=15
+        )
+        self.status_label.grid(row=2, column=0, sticky="ew", pady=(0, 0))
 
-    def _resize_canvas(self):
-        w = 2 * self.PAD + self.maze.cols * self.CELL_PX
-        h = 2 * self.PAD + self.maze.rows * self.CELL_PX
-        self.canvas.config(width=w, height=h)
-        self.root.minsize(min(w + 20, 1200), min(h + 145, 900))
+    def _resize_window(self):
+        w = 2 * self.PAD + self.maze.cols * self.CELL_PX + 340
+        h = 2 * self.PAD + self.maze.rows * self.CELL_PX + 220
+        self.root.geometry(f"{int(w)}x{int(h)}")
+        self.root.minsize(int(w), int(h))
 
     def new_maze(self):
         if not messagebox.askyesno("New maze", "Clear the current maze?"):
             return
+        self.save_state()
         self.maze = MazeData(rows=self.maze.rows, cols=self.maze.cols, cell_size_m=self.maze.cell_size_m)
         self.current_file = None
         self.clear_route()
         self.redraw()
 
-    def apply_cell_size(self):
+    def apply_grid_settings(self):
         try:
-            value = float(self.cell_size_entry.get())
-            if not 0.05 <= value <= 5.0:
-                raise ValueError
+            r = int(self.rows_entry.get())
+            c = int(self.cols_entry.get())
+            cs = float(self.cell_size_entry.get())
+            if not (2 <= r <= 40 and 2 <= c <= 40): raise ValueError
+            if not 0.05 <= cs <= 5.0: raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid cell size", "Enter a value between 0.05 and 5.0 metres")
+            messagebox.showerror("Invalid input", "Rows/Cols 2-40. Cell size 0.05-5.0")
             return
-        self.maze.cell_size_m = value
-        self.status.set(f"Cell size = {value:.3f} m")
+        
+        self.save_state()
+        self.maze.rows = r
+        self.maze.cols = c
+        self.maze.cell_size_m = cs
+        
+        # Cleanup out of bounds
+        out_of_bounds = [w for w in self.maze.walls if not (self.maze.in_bounds(w[0]) and self.maze.in_bounds(w[1]))]
+        for w in out_of_bounds: self.maze.walls.discard(w)
+        if self.maze.start and not self.maze.in_bounds(self.maze.start): self.maze.start = None
+        if self.maze.object_cell and not self.maze.in_bounds(self.maze.object_cell): self.maze.object_cell = None
+        if self.maze.drop_cell and not self.maze.in_bounds(self.maze.drop_cell): self.maze.drop_cell = None
+        if self.maze.goal and not self.maze.in_bounds(self.maze.goal): self.maze.goal = None
+        
+        self.route = []
         self.route_plan = None
+        self.cancel_animation()
+        self._resize_window()
+        self.redraw()
+        self.status.set(f"Grid updated to {r}x{c}, Size: {cs}m")
+
+    def cancel_animation(self):
+        if self.anim_id:
+            self.root.after_cancel(self.anim_id)
+            self.anim_id = None
+        if hasattr(self, 'gif_anim_id') and self.gif_anim_id:
+            self.root.after_cancel(self.gif_anim_id)
+            self.gif_anim_id = None
+        if hasattr(self, 'gif_anim_id') and self.gif_anim_id:
+            self.root.after_cancel(self.gif_anim_id)
+            self.gif_anim_id = None
 
     def clear_route(self):
+        self.cancel_animation()
         self.route = []
         self.route_plan = None
         self.redraw()
 
     def rotate_start(self):
+        self.save_state()
         i = HEADINGS.index(self.maze.start_heading)
         self.maze.start_heading = HEADINGS[(i + 1) % 4]
         self.route_plan = None
@@ -677,7 +972,6 @@ class MazeDesignerApp:
         dr, dc = HEADING_VEC[heading]
         other = (cell[0] + dr, cell[1] + dc)
         if not self.maze.in_bounds(other):
-            # Outer border remains a wall in this first version.
             return None
         return cell, other
 
@@ -685,11 +979,14 @@ class MazeDesignerApp:
         cell = self.event_to_cell(event.x, event.y)
         if cell is None:
             return
+        
+        self.save_state()
         mode = self.mode.get()
 
         if mode in ("WALL", "ERASE"):
             edge = self.nearest_internal_edge(cell, event.x, event.y)
             if edge is None:
+                self.history_undo.pop()
                 self.status.set("Click closer to an INTERNAL cell edge to edit a wall")
                 return
             self.maze.set_wall_between(edge[0], edge[1], mode == "WALL")
@@ -707,30 +1004,112 @@ class MazeDesignerApp:
             self.maze.goal = cell
             self.status.set(f"EXIT = {cell}")
 
-        self.route = []
-        self.route_plan = None
-        self.redraw()
+        self.clear_route()
 
     def preview_route(self):
-        self.apply_cell_size()
+        try:
+            r = int(self.rows_entry.get())
+            c = int(self.cols_entry.get())
+            cs = float(self.cell_size_entry.get())
+            self.maze.rows = r
+            self.maze.cols = c
+            self.maze.cell_size_m = cs
+        except: pass
+        
         try:
             plan = validate_and_plan(self.maze)
         except ValueError as exc:
             messagebox.showerror("Route error", str(exc))
             return
+            
         self.route_plan = plan
         self.route = [tuple(c) for c in plan["path"]]
         warning = " | ".join(plan["warnings"])
         self.status.set(
-            f"Guide OK: {len(plan['topology_guide']['nodes'])} recognisable nodes, "
-            f"{plan['total_cells']} drawn cells (distance hint only)" + (f" | WARNING: {warning}" if warning else "")
+            f"Guide OK: {len(plan['topology_guide']['nodes'])} nodes, "
+            f"{plan['total_cells']} cells" + (f" | WARNING: {warning}" if warning else "")
         )
         self.redraw()
+        
+        # Start Animation
+        self.cancel_animation()
+        self.anim_index = 0
+        self.animate_robot()
+
         if warning:
             messagebox.showwarning("Route warning", warning)
 
+    def animate_robot(self):
+        if self.anim_index >= len(self.route):
+            self.anim_id = None
+            return
+            
+        if self.anim_index == 0:
+            self.redraw()
+            if hasattr(self, 'robot_frames') and len(self.robot_frames) > 1:
+                self.update_gif_frame()
+            
+        cell = self.route[self.anim_index]
+        x0, y0, x1, y1 = self.cell_rect(cell)
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        
+        self.canvas.delete("robot")
+        if self.robot_image:
+            self.canvas.create_image(cx, cy, image=self.robot_image, tags="robot")
+        else:
+            rad = self.CELL_PX * 0.35
+            self.canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill="#ff9eb5", outline="#1f2a63", width=3, tags="robot")
+            self.canvas.create_oval(cx - rad/2, cy - rad/2, cx + rad/2, cy + rad/2, fill="#fff785", outline="", tags="robot")
+            
+        self.canvas.tag_raise("robot")
+        self.anim_index += 1
+        self.anim_id = self.root.after(300, self.animate_robot)
+
+    def export_png_dialog(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")],
+            title="Save as PNG",
+            initialfile="maze_screenshot.png"
+        )
+        if not path:
+            return
+        
+        try:
+            if HAS_PIL and hasattr(ImageGrab, "grab"):
+                self.root.update_idletasks()
+                x = self.canvas.winfo_rootx()
+                y = self.canvas.winfo_rooty()
+                w = self.canvas.winfo_width()
+                h = self.canvas.winfo_height()
+                img = ImageGrab.grab(bbox=(x, y, x+w, y+h))
+                img.save(path)
+                self.status.set(f"Saved PNG to {os.path.basename(path)}")
+                messagebox.showinfo("Success", f"Saved PNG to:\n{path}")
+            else:
+                self.status.set("Error: PIL.ImageGrab not available.")
+        except Exception as e:
+            self.status.set(f"Save PNG failed: {e}")
+
+    def get_reachable_cells(self):
+        reachable = set()
+        start = self.maze.start if self.maze.start else (0, 0)
+        if not self.maze.in_bounds(start): return reachable
+        
+        queue = [start]
+        visited = {start}
+        
+        while queue:
+            curr = queue.pop(0)
+            reachable.add(curr)
+            for nr, nc in self.maze.neighbors(curr):
+                if not self.maze.has_wall_between(curr, (nr, nc)):
+                    if (nr, nc) not in visited:
+                        visited.add((nr, nc))
+                        queue.append((nr, nc))
+        return reachable
+
     def save_maze_dialog(self):
-        self.apply_cell_size()
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("Maze JSON", "*.json"), ("All files", "*.*")],
@@ -747,21 +1126,20 @@ class MazeDesignerApp:
         if not path:
             return
         try:
+            self.save_state()
             self.maze = load_maze(path)
         except Exception as exc:
             messagebox.showerror("Load error", str(exc))
             return
         self.current_file = path
-        self.cell_size_entry.delete(0, tk.END)
-        self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
-        self.route = []
-        self.route_plan = None
-        self._resize_canvas()
-        self.redraw()
+        self.rows_entry.delete(0, tk.END); self.rows_entry.insert(0, str(self.maze.rows))
+        self.cols_entry.delete(0, tk.END); self.cols_entry.insert(0, str(self.maze.cols))
+        self.cell_size_entry.delete(0, tk.END); self.cell_size_entry.insert(0, str(self.maze.cell_size_m))
+        self.clear_route()
+        self._resize_window()
         self.status.set(f"Loaded maze: {path}")
 
     def export_route_dialog(self):
-        self.apply_cell_size()
         try:
             plan = validate_and_plan(self.maze)
         except ValueError as exc:
@@ -784,21 +1162,32 @@ class MazeDesignerApp:
         c = self.canvas
         c.delete("all")
 
+        route_color = "#ff7eac"
+        route_glow = "#ffdbe7"
+        cell_fill = "#ffffff"
+        cell_outline = "#c7d7f7"
+        text_color = "#99b6ea"
+        wall_color = "#1f2a63"
+        border_color = "#1f2a63"
+        
         # Route preview first, under grid walls.
         if len(self.route) >= 2:
             pts = []
             for cell in self.route:
                 x0, y0, x1, y1 = self.cell_rect(cell)
                 pts.extend(((x0 + x1) / 2, (y0 + y1) / 2))
-            c.create_line(*pts, width=6, fill="#6a5acd", smooth=False, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            c.create_line(*pts, width=12, fill=route_glow, smooth=False, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
+        reachable = self.get_reachable_cells()
 
         # Cell background and labels.
         for r in range(self.maze.rows):
             for col in range(self.maze.cols):
                 cell = (r, col)
                 x0, y0, x1, y1 = self.cell_rect(cell)
-                c.create_rectangle(x0, y0, x1, y1, fill="#ffffff", outline="#dedede")
-                c.create_text(x0 + 5, y0 + 5, text=f"{r},{col}", anchor="nw", fill="#aaaaaa", font=("Arial", 7))
+                fill_color = cell_fill if cell in reachable else "#dee7f7"
+                c.create_rectangle(x0, y0, x1, y1, fill=fill_color, outline=cell_outline, width=2)
+                c.create_text(x0 + 6, y0 + 6, text=f"{r},{col}", anchor="nw", fill=text_color, font=("Courier New", 8, "bold"))
 
         # Route redraw on top of cell fill.
         if len(self.route) >= 2:
@@ -806,14 +1195,14 @@ class MazeDesignerApp:
             for cell in self.route:
                 x0, y0, x1, y1 = self.cell_rect(cell)
                 pts.extend(((x0 + x1) / 2, (y0 + y1) / 2))
-            c.create_line(*pts, width=5, fill="#6a5acd", capstyle=tk.ROUND, joinstyle=tk.ROUND)
+            c.create_line(*pts, width=6, fill=route_color, capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
         # Outer border.
         left = self.PAD
         top = self.PAD
         right = self.PAD + self.maze.cols * self.CELL_PX
         bottom = self.PAD + self.maze.rows * self.CELL_PX
-        c.create_rectangle(left, top, right, bottom, width=4, outline="#111111")
+        c.create_rectangle(left, top, right, bottom, width=4, outline=border_color)
 
         # Internal walls.
         for a, b in self.maze.walls:
@@ -822,37 +1211,29 @@ class MazeDesignerApp:
             ax0, ay0, ax1, ay1 = self.cell_rect(a)
             if ar == br:
                 x = ax1 if bc > ac else ax0
-                c.create_line(x, ay0, x, ay1, width=5, fill="#111111")
+                c.create_line(x, ay0, x, ay1, width=6, fill=wall_color)
             else:
                 y = ay1 if br > ar else ay0
-                c.create_line(ax0, y, ax1, y, width=5, fill="#111111")
+                c.create_line(ax0, y, ax1, y, width=6, fill=wall_color)
 
         # Markers.
         if self.maze.start is not None:
-            self._draw_marker(self.maze.start, "S", "#2e8b57")
+            self._draw_marker(self.maze.start, "S", self.color_btn_green)
         if self.maze.object_cell is not None:
-            self._draw_marker(self.maze.object_cell, "P", "#ff8c00")
+            self._draw_marker(self.maze.object_cell, "P", "#ffb459")
         if self.maze.drop_cell is not None:
-            self._draw_marker(self.maze.drop_cell, "D", "#1e90ff")
+            self._draw_marker(self.maze.drop_cell, "D", "#7ea8f8")
         if self.maze.goal is not None:
-            self._draw_marker(self.maze.goal, "E", "#b22222")
+            self._draw_marker(self.maze.goal, "E", "#ff9eb5")
 
     def _draw_marker(self, cell: Cell, text: str, color: str):
         x0, y0, x1, y1 = self.cell_rect(cell)
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        rad = self.CELL_PX * 0.25
-        self.canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill=color, outline="")
-        self.canvas.create_text(cx, cy, text=text, fill="white", font=("Arial", 14, "bold"))
-
-    def _draw_heading_arrow(self, cell: Cell, heading: str):
-        x0, y0, x1, y1 = self.cell_rect(cell)
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        dr, dc = HEADING_VEC[heading]
-        length = self.CELL_PX * 0.37
-        # row increases downward, which already matches canvas Y.
-        ex = cx + dc * length
-        ey = cy + dr * length
-        self.canvas.create_line(cx, cy, ex, ey, width=4, fill="#006400", arrow=tk.LAST, arrowshape=(10, 12, 5))
+        rad = self.CELL_PX * 0.32
+        
+        self.canvas.create_oval(cx - rad + 3, cy - rad + 3, cx + rad + 3, cy + rad + 3, fill=self.color_border, outline="")
+        self.canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill=color, outline=self.color_border, width=2)
+        self.canvas.create_text(cx, cy, text=text, fill=self.color_text, font=("Courier New", 14, "bold"))
 
 
 def cli_plan(maze_path: str, output: Optional[str]) -> int:
@@ -877,7 +1258,7 @@ def main() -> int:
     if args.plan:
         return cli_plan(args.plan, args.out)
 
-    root = tk.Tk()
+    root = ctk.CTk()
     MazeDesignerApp(root, rows=max(2, args.rows), cols=max(2, args.cols), cell_size_m=args.cell_size)
     root.mainloop()
     return 0
