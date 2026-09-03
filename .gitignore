@@ -1,28 +1,35 @@
-# Python cache files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyd
 
-# Environments
-.env
-.venv
-env/
+# Virtual environment
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
+env/
 
-# Generated Output & Data
-output/
-map_engine/output/
-*.csv
-*.png
-*.json
-*.log
-scratch/
-
-# IDE & OS files
+# IDE
 .vscode/
 .idea/
+
+# Operating system
 .DS_Store
 Thumbs.db
+
+# Runtime files
+*.log
+*.tmp
+
+# Generated experimental data
+results/raw/
+logs/
+
+# Local configuration
+.env
+config/local_config.json
+
+!docs/results/**/*.json
+!docs/results/**/*.svg
+!docs/results/**/*.png
+!docs/results/**/*.jpg
+!docs/results/**/*.jpeg
