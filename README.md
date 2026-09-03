@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/SIRP00M/RoboMaster-NavMap"><img src="https://img.shields.io/badge/GitHub-RoboMaster--NavMap-181717?logo=github" alt="GitHub Repository"></a>
-  <a href="https://youtu.be/44vI4HtLeyQ"><img src="https://img.shields.io/badge/YouTube-Watch%20Demo-FF0000?logo=youtube&logoColor=white" alt="YouTube Demo"></a>
+  <a href="https://youtu.be/o_m5TY0pPXU"><img src="https://img.shields.io/badge/YouTube-Watch%20Demo-FF0000?logo=youtube&logoColor=white" alt="YouTube Demo"></a>
   <img src="https://img.shields.io/badge/Platform-DJI%20RoboMaster%20EP-0A84FF" alt="DJI RoboMaster EP">
   <img src="https://img.shields.io/badge/Language-Python-3776AB?logo=python&logoColor=white" alt="Python">
 </p>
@@ -14,7 +14,7 @@
 <p align="center">
   <b>Repository:</b> <a href="https://github.com/SIRP00M/RoboMaster-NavMap">SIRP00M/RoboMaster-NavMap</a>
   &nbsp;•&nbsp;
-  <b>Demo Video:</b> <a href="https://youtu.be/44vI4HtLeyQ">YouTube</a>
+  <b>Demo Video:</b> <a href="https://youtu.be/o_m5TY0pPXU">YouTube</a>
 </p>
 
 ---
@@ -107,13 +107,13 @@ The primary navigation stack combines **orientation-aware A\*** with **wheel odo
 The following video demonstrates a complete real-world mission, including object pickup, autonomous maze navigation, drop-position alignment, object release, and navigation to the exit.
 
 <p align="center">
-  <a href="https://youtu.be/44vI4HtLeyQ">
-    <img src="https://img.youtube.com/vi/44vI4HtLeyQ/hqdefault.jpg" alt="RoboMaster EP Autonomous Maze Navigation Demo" width="820">
+  <a href="https://youtu.be/o_m5TY0pPXU">
+    <img src="https://img.youtube.com/vi/o_m5TY0pPXU/hqdefault.jpg" alt="RoboMaster EP Autonomous Maze Navigation Demo" width="820">
   </a>
 </p>
 
 <p align="center">
-  ▶️ <b><a href="https://youtu.be/44vI4HtLeyQ">Watch the full mission demo on YouTube</a></b><br>
+  ▶️ <b><a href="https://youtu.be/o_m5TY0pPXU">Watch the full mission demo on YouTube</a></b><br>
   <i>RoboMaster EP Autonomous Maze Navigation | A* Pickup & Drop Mission</i>
 </p>
 
@@ -738,7 +738,7 @@ V12.5_FIELD_READY_TOPO_GUIDE_V2
 
 - **Main repository:** [SIRP00M/RoboMaster-NavMap](https://github.com/SIRP00M/RoboMaster-NavMap)
 - **Clone:** `git clone https://github.com/SIRP00M/RoboMaster-NavMap.git`
-- **Demo video:** [RoboMaster EP Autonomous Maze Navigation | A* Pickup & Drop Mission](https://youtu.be/44vI4HtLeyQ)
+- **Demo video:** [RoboMaster EP Autonomous Maze Navigation | A* Pickup & Drop Mission](https://youtu.be/o_m5TY0pPXU)
 
 > Images in this README use repository-relative paths under `docs/images/` and `docs/results/`, so they render directly on GitHub as long as those files remain in the same folders.
 
